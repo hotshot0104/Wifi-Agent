@@ -1,0 +1,69 @@
+# WiFi Agent
+
+WiFi Agent is a lightweight, cross-platform background service for networks
+using a Sophos or Cyberoam captive portal. It monitors wired connectivity,
+checks whether the portal is reachable, verifies real internet access, and
+automatically restores or keeps alive an authenticated session.
+
+## Features
+
+- Supports Windows, macOS, and Linux.
+- Distinguishes Ethernet, portal-port, and internet status.
+- Logs in only when Ethernet is connected and internet access is unavailable.
+- Stores passwords in the operating system credential vault—never in project
+  files or `config.json`.
+- Provides a compact graphical setup and diagnostics window.
+- Starts automatically at user login and restarts after failures.
+
+## Requirements
+
+- Python 3.10 or newer
+- An unlocked OS credential vault: Windows Credential Manager, macOS Keychain,
+  or a Linux Secret Service provider
+- On some Linux distributions, the `python3-tk` package
+
+## Installation
+
+On Windows, double-click `install.cmd` or run:
+
+```powershell
+.\install.ps1
+```
+
+On macOS or Linux, run:
+
+```sh
+./install.sh
+```
+
+Enter the portal credentials and settings, select the correct Ethernet adapter
+if automatic detection is unsuitable, choose **Test now**, then choose
+**Save & install service**.
+
+The installer creates an isolated runtime in the user's application-data
+directory. The downloaded project folder can be moved or removed afterward.
+
+## Management
+
+Pass a command through the platform installer:
+
+```sh
+./install.sh setup       # Change credentials or settings
+./install.sh run         # Run interactively
+./install.sh run --once  # Run one diagnostic/login cycle
+./install.sh status      # Display recent agent logs
+./install.sh install     # Reinstall and start the startup service
+./install.sh uninstall   # Remove the service but retain settings
+```
+
+On Windows, use `install.cmd` with the same arguments.
+
+## Security and startup
+
+The password is stored through the system credential API. Non-secret settings
+and the username are stored in the user's configuration directory. Portal-only
+TLS verification can be relaxed for appliances using self-signed certificates;
+internet probes continue to require trusted HTTPS certificates.
+
+WiFi Agent starts when the user logs in rather than during pre-login boot,
+because system credential vaults are normally locked before that point.
