@@ -45,7 +45,7 @@ except ImportError:
 
 APP_NAME = "WiFiAgent"
 APP_DISPLAY_NAME = "WiFi Agent"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 if getattr(sys, "frozen", False):
     try:
         from wifi_agent_build import BUILD_VERSION
