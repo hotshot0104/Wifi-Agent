@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python -m pip install ruff
+      - run: python -m pip install ruff==0.15.17
       - run: python -m unittest discover -s tests -v
       - run: ruff check wifi_agent.py install.py packaging/generate_assets.py tests/test_wifi_agent.py
 
