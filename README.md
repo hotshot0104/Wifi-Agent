@@ -22,14 +22,38 @@ automatically restores or keeps alive an authenticated session.
 
 ## Requirements
 
-- Python 3.10 or newer
+- Native installer: no separate Python installation is required
+- Source/script installation: Python 3.10 or newer
 - An unlocked OS credential vault: Windows Credential Manager, macOS Keychain,
   or a Linux Secret Service provider
 - On some Linux distributions, the `python3-tk` package
 
 ## Installation
 
-On Windows, double-click `install.cmd` or run:
+### Native installers
+
+Download the installer matching the computer from the GitHub release:
+
+- **Windows 64-bit:** run `WiFiAgent-<version>-Windows-x64-Setup.exe`. The
+  per-user installer does not require administrator access and opens the secure
+  settings window when it finishes.
+- **Apple silicon Mac:** open the `arm64` `.pkg` or `.dmg`.
+- **Intel Mac:** open the `x86_64` `.pkg` or `.dmg`.
+
+The macOS package installs **WiFi Agent.app** in `/Applications` and opens its
+settings for the signed-in user. The disk image offers the familiar alternative
+of dragging **WiFi Agent.app** into **Applications** and opening it once.
+
+Enter the portal credentials and settings, select the correct Ethernet adapter
+if automatic detection is unsuitable, choose **Test Connection**, then choose
+**Save & Install at Login** on macOS or **Save & install** on Windows. This
+stores the password in the operating-system credential vault and activates the
+login-time agent.
+
+### Script installation
+
+The source-based installers remain available for development and Linux. On
+Windows, double-click `install.cmd` or run:
 
 ```powershell
 .\install.ps1
@@ -40,10 +64,6 @@ On macOS or Linux, run:
 ```sh
 ./install.sh
 ```
-
-Enter the portal credentials and settings, select the correct Ethernet adapter
-if automatic detection is unsuitable, choose **Test Connection**, then choose
-**Save & Install at Login** on macOS or **Save & install** on Windows and Linux.
 
 The dashboard's **Overview** tab (**General** on macOS) shows live Ethernet,
 portal-port, internet, process, and startup health. **Settings** (**Connection**
@@ -64,12 +84,15 @@ standard Command–Comma, Command–S, and Command–W shortcuts. Choosing **Qui
 WiFi Agent** keeps it closed for the rest of the login session; it starts again
 at the next login.
 
-The installer creates an isolated runtime in the user's application-data
-directory. The downloaded project folder can be moved or removed afterward.
+The script installer creates an isolated runtime in the user's application-data
+directory. Native installers bundle their runtime inside the installed app, so
+neither installation method depends on the downloaded project folder afterward.
 
 ## Management
 
-Pass a command through the platform installer:
+Native-installer users can manage the agent from its menu-bar/taskbar icon and
+settings window. For a source installation, pass a command through the platform
+installer:
 
 ```sh
 ./install.sh setup       # Change credentials or settings
@@ -92,6 +115,51 @@ Run the dependency-free regression suite with:
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+### Building native installers
+
+PyInstaller must run on the target operating system; it does not cross-compile
+Windows and macOS applications. Install the application and build dependencies
+on the target machine first:
+
+```sh
+python -m pip install -r requirements.txt -r packaging/requirements-build.txt
+```
+
+On Windows, install Inno Setup 6 or 7 and run:
+
+```powershell
+.\packaging\windows\build-installer.ps1
+```
+
+On macOS, run:
+
+```sh
+./packaging/macos/build-installer.sh
+```
+
+Outputs are written beneath `build/windows/installer` or
+`build/macos/installer`. The macOS builder produces both `.pkg` and `.dmg`
+files. Set `MACOS_APP_SIGNING_IDENTITY`, `MACOS_INSTALLER_SIGNING_IDENTITY`,
+and `APPLE_NOTARY_KEYCHAIN_PROFILE` to create Developer ID-signed and notarized
+release artifacts; without them, the builder creates development artifacts.
+
+The Windows builder similarly signs both the application executable and setup
+executable when `WINDOWS_SIGNING_CERTIFICATE` points to a PFX file; provide its
+password through `WINDOWS_SIGNING_PASSWORD`.
+
+The **Build native installers** GitHub Actions workflow runs tests and builds a
+Windows x64 installer plus separate Apple silicon and Intel macOS installers.
+Run it manually for test artifacts. Pushing a version tag such as `v1.0.0`
+builds the installers and attaches them to a GitHub release automatically.
+Tagged builds intentionally fail instead of publishing unsigned software. Add
+the following repository secrets before creating a release tag:
+
+- `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD`
+- `MACOS_CERTIFICATE_BASE64` and `MACOS_CERTIFICATE_PASSWORD`
+- `MACOS_APP_SIGNING_IDENTITY` and `MACOS_INSTALLER_SIGNING_IDENTITY`
+- `APPLE_NOTARY_APPLE_ID`, `APPLE_NOTARY_PASSWORD`, and
+  `APPLE_NOTARY_TEAM_ID`
 
 ## Security and startup
 
