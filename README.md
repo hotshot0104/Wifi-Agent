@@ -13,7 +13,10 @@ automatically restores or keeps alive an authenticated session.
 - Stores passwords in the operating system credential vault—never in project
   files or `config.json`.
 - Provides a compact graphical setup and diagnostics window.
+- Provides a Windows notification-area icon for day-to-day management.
 - Starts automatically at user login and restarts after failures.
+- Prevents duplicate monitor instances and uses bounded exponential retry
+  backoff when a portal or upstream connection is unhealthy.
 
 ## Requirements
 
@@ -37,8 +40,14 @@ On macOS or Linux, run:
 ```
 
 Enter the portal credentials and settings, select the correct Ethernet adapter
-if automatic detection is unsuitable, choose **Test now**, then choose
-**Save & install service**.
+if automatic detection is unsuitable, choose **Test connection**, then choose
+**Save & install**.
+
+On Windows, installation starts a WiFi Agent icon in the notification area of
+the taskbar. Click it to open settings, or right-click it to check and
+log in immediately, pause/resume monitoring, open logs, or exit until the next
+Windows login. The command script is only needed for the initial installation
+or troubleshooting.
 
 The installer creates an isolated runtime in the user's application-data
 directory. The downloaded project folder can be moved or removed afterward.
@@ -51,12 +60,23 @@ Pass a command through the platform installer:
 ./install.sh setup       # Change credentials or settings
 ./install.sh run         # Run interactively
 ./install.sh run --once  # Run one diagnostic/login cycle
-./install.sh status      # Display recent agent logs
+./install.sh check       # Ask the running agent to check immediately
+./install.sh status      # Display live state and recent logs
+./install.sh doctor      # Validate configuration, vault, and startup
+./install.sh open-logs   # Open the log location
 ./install.sh install     # Reinstall and start the startup service
 ./install.sh uninstall   # Remove the service but retain settings
 ```
 
 On Windows, use `install.cmd` with the same arguments.
+
+## Development
+
+Run the dependency-free regression suite with:
+
+```sh
+python -m unittest discover -s tests -v
+```
 
 ## Security and startup
 
@@ -64,6 +84,11 @@ The password is stored through the system credential API. Non-secret settings
 and the username are stored in the user's configuration directory. Portal-only
 TLS verification can be relaxed for appliances using self-signed certificates;
 internet probes continue to require trusted HTTPS certificates.
+
+The monitor reloads changed settings without a restart, writes an atomic status
+snapshot for the UI and CLI, rejects captive-portal redirects during internet
+checks, sanitizes portal responses before logging, and isolates unexpected
+cycle failures so one bad adapter or request does not stop the service.
 
 WiFi Agent starts when the user logs in rather than during pre-login boot,
 because system credential vaults are normally locked before that point.
