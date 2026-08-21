@@ -196,6 +196,14 @@ def read_status() -> dict[str, Any] | None:
         return None
 
 
+def snapshot_process_running(snapshot: dict[str, Any] | None) -> bool:
+    try:
+        process_id = int((snapshot or {}).get("process_id") or 0)
+        return bool(psutil is not None and process_id > 0 and psutil.pid_exists(process_id))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def request_external_check() -> None:
     app_dir().mkdir(parents=True, exist_ok=True)
     temporary = WAKE_PATH.with_suffix(".tmp")
@@ -1079,10 +1087,18 @@ def show_setup_ui() -> int:
     ensure_dependencies()
     try:
         import tkinter as tk
-        from tkinter import messagebox, ttk
+        from tkinter import messagebox, scrolledtext, ttk
     except ImportError:
         print("Tkinter is not installed. On Debian/Ubuntu, install python3-tk, then retry.", file=sys.stderr)
         return 2
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            pass
 
     configuration_warning = ""
     try:
@@ -1090,11 +1106,70 @@ def show_setup_ui() -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         config = validate_config(DEFAULT_CONFIG)
         configuration_warning = f"The saved configuration could not be loaded and must be repaired: {exc}"
+
     root = tk.Tk()
     root.title("WiFi Agent")
-    root.resizable(False, False)
-    frame = ttk.Frame(root, padding=20)
-    frame.grid()
+    root.geometry("780x700")
+    root.minsize(720, 620)
+
+    colors = {
+        "background": "#f4f7fb",
+        "surface": "#ffffff",
+        "primary": "#1769d8",
+        "text": "#172033",
+        "muted": "#637083",
+        "success": "#168553",
+        "warning": "#c47a00",
+        "danger": "#c43d4b",
+        "idle": "#8591a3",
+    }
+    root.configure(background=colors["background"])
+    style = ttk.Style(root)
+    available_themes = style.theme_names()
+    preferred_theme = "vista" if sys.platform == "win32" else "aqua" if sys.platform == "darwin" else "clam"
+    if preferred_theme in available_themes:
+        style.theme_use(preferred_theme)
+    default_font = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+    style.configure("App.TFrame", background=colors["background"])
+    style.configure("Surface.TFrame", background=colors["surface"])
+    style.configure("Header.TLabel", background=colors["background"], foreground=colors["text"], font=(default_font, 22, "bold"))
+    style.configure("Subtitle.TLabel", background=colors["background"], foreground=colors["muted"], font=(default_font, 10))
+    style.configure("CardTitle.TLabel", background=colors["surface"], foreground=colors["muted"], font=(default_font, 9, "bold"))
+    style.configure("CardValue.TLabel", background=colors["surface"], foreground=colors["text"], font=(default_font, 13, "bold"))
+    style.configure("StatusTitle.TLabel", background=colors["surface"], foreground=colors["text"], font=(default_font, 15, "bold"))
+    style.configure("StatusText.TLabel", background=colors["surface"], foreground=colors["muted"], font=(default_font, 10))
+    style.configure("Hint.TLabel", foreground=colors["muted"], font=(default_font, 9))
+    style.configure("Accent.TButton", font=(default_font, 9, "bold"), padding=(13, 7))
+    style.configure("Action.TButton", padding=(11, 7))
+    style.configure("TNotebook", background=colors["background"], borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(18, 9), font=(default_font, 9, "bold"))
+
+    icon = tk.PhotoImage(width=32, height=32)
+    icon.put(colors["primary"], to=(3, 3, 29, 29))
+    icon.put("#ffffff", to=(9, 10, 23, 13))
+    icon.put("#ffffff", to=(12, 16, 20, 19))
+    icon.put("#ffffff", to=(15, 22, 18, 25))
+    root.iconphoto(True, icon)
+
+    main = ttk.Frame(root, style="App.TFrame", padding=(24, 18, 24, 20))
+    main.pack(fill="both", expand=True)
+    header = ttk.Frame(main, style="App.TFrame")
+    header.pack(fill="x", pady=(0, 14))
+    ttk.Label(header, text="WiFi Agent", style="Header.TLabel").pack(anchor="w")
+    ttk.Label(
+        header,
+        text="Sophos/Cyberoam connectivity monitoring, secure login, and service management",
+        style="Subtitle.TLabel",
+    ).pack(anchor="w", pady=(2, 0))
+
+    notebook = ttk.Notebook(main)
+    notebook.pack(fill="both", expand=True)
+    overview_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
+    settings_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
+    diagnostics_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
+    notebook.add(overview_tab, text="Overview")
+    notebook.add(settings_tab, text="Settings")
+    notebook.add(diagnostics_tab, text="Diagnostics")
 
     username = tk.StringVar(value=str(config["username"]))
     password = tk.StringVar()
@@ -1105,57 +1180,163 @@ def show_setup_ui() -> int:
     max_backoff = tk.StringVar(value=str(config["login_backoff_max_seconds"]))
     interface = tk.StringVar(value=str(config.get("network_interface", "auto")))
     insecure = tk.BooleanVar(value=bool(config.get("allow_self_signed_portal", True)))
-    status = tk.StringVar(value="Loading agent status…")
-    startup_status = tk.StringVar(value="")
+    show_password = tk.BooleanVar(value=False)
+    status_title = tk.StringVar(value="Loading agent status…")
+    status_detail = tk.StringVar(value="Waiting for the first status snapshot")
+    runtime_value = tk.StringVar(value="Checking…")
+    startup_value = tk.StringVar(value="Checking…")
+    ethernet_value = tk.StringVar(value="Not checked")
+    portal_value = tk.StringVar(value="Not checked")
+    internet_value = tk.StringVar(value="Not checked")
+    last_check_value = tk.StringVar(value="Never")
+    feedback_value = tk.StringVar(value="Settings are stored locally; the password remains in the OS credential vault.")
+    feedback_override_until = {"value": 0.0}
+    startup_installed = {"value": startup_is_installed()}
+    agent_running = {"value": False}
 
-    ttk.Label(frame, text="WiFi Agent", font=("TkDefaultFont", 15, "bold")).grid(
-        row=0, column=0, columnspan=3, sticky="w", pady=(0, 3)
+    # Overview status card.
+    status_card = ttk.Frame(overview_tab, style="Surface.TFrame", padding=18)
+    status_card.pack(fill="x", pady=(0, 12))
+    status_dot = tk.Canvas(status_card, width=22, height=22, highlightthickness=0, background=colors["surface"])
+    status_dot.pack(side="left", padx=(0, 12), anchor="n", pady=2)
+    status_dot_id = status_dot.create_oval(3, 3, 19, 19, fill=colors["idle"], outline="")
+    status_copy = ttk.Frame(status_card, style="Surface.TFrame")
+    status_copy.pack(side="left", fill="x", expand=True)
+    ttk.Label(status_copy, textvariable=status_title, style="StatusTitle.TLabel", wraplength=610).pack(anchor="w")
+    ttk.Label(status_copy, textvariable=status_detail, style="StatusText.TLabel", wraplength=610).pack(anchor="w", pady=(3, 0))
+
+    metrics = ttk.Frame(overview_tab, style="App.TFrame")
+    metrics.pack(fill="x", pady=(0, 12))
+    for column in range(3):
+        metrics.columnconfigure(column, weight=1, uniform="metric")
+
+    def metric_card(column: int, title: str, variable: tk.StringVar) -> None:
+        card = ttk.Frame(metrics, style="Surface.TFrame", padding=14)
+        card.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0 if column == 2 else 5))
+        ttk.Label(card, text=title.upper(), style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(7, 0))
+
+    metric_card(0, "Ethernet", ethernet_value)
+    metric_card(1, "Portal port", portal_value)
+    metric_card(2, "Internet", internet_value)
+
+    service_card = ttk.Frame(overview_tab, style="Surface.TFrame", padding=18)
+    service_card.pack(fill="x", pady=(0, 12))
+    service_card.columnconfigure(0, weight=1)
+    ttk.Label(service_card, text="AGENT & STARTUP", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(service_card, textvariable=runtime_value, style="CardValue.TLabel").grid(row=1, column=0, sticky="w", pady=(7, 0))
+    ttk.Label(service_card, textvariable=startup_value, style="StatusText.TLabel").grid(row=2, column=0, sticky="w", pady=(3, 0))
+    ttk.Label(service_card, textvariable=last_check_value, style="StatusText.TLabel").grid(row=3, column=0, sticky="w", pady=(3, 0))
+    service_actions = ttk.Frame(service_card, style="Surface.TFrame")
+    service_actions.grid(row=0, column=1, rowspan=4, sticky="e")
+
+    quick_actions = ttk.Frame(overview_tab, style="App.TFrame")
+    quick_actions.pack(fill="x")
+
+    # Settings tab.
+    account_group = ttk.LabelFrame(settings_tab, text=" Account ", padding=14)
+    account_group.pack(fill="x", pady=(0, 10))
+    account_group.columnconfigure(1, weight=1)
+    ttk.Label(account_group, text="Username / roll number").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
+    ttk.Entry(account_group, textvariable=username).grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+    ttk.Label(account_group, text="Password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+    password_entry = ttk.Entry(account_group, textvariable=password, show="•")
+    password_entry.grid(row=1, column=1, sticky="ew", pady=5)
+
+    def toggle_password_visibility() -> None:
+        password_entry.configure(show="" if show_password.get() else "•")
+
+    ttk.Checkbutton(
+        account_group,
+        text="Show",
+        variable=show_password,
+        command=toggle_password_visibility,
+    ).grid(row=1, column=2, padx=(8, 0), pady=5)
+    ttk.Label(account_group, text="Leave blank to keep the saved credential.", style="Hint.TLabel").grid(
+        row=2, column=1, columnspan=2, sticky="w", pady=(0, 2)
     )
-    ttk.Label(
-        frame,
-        text="Secure Sophos/Cyberoam connectivity monitoring and session recovery",
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
-    def add_entry(row: int, label: str, variable, secret: bool = False) -> None:
-        ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 12))
-        ttk.Entry(frame, textvariable=variable, show="*" if secret else "", width=38).grid(
-            row=row, column=1, columnspan=2, sticky="ew", pady=4
-        )
-
-    add_entry(3, "Username / roll number", username)
-    add_entry(4, "Password", password, True)
-    ttk.Label(frame, text="Portal protocol").grid(row=5, column=0, sticky="w", pady=4, padx=(0, 12))
-    ttk.Combobox(frame, textvariable=scheme, values=("https", "http"), state="readonly", width=35).grid(
-        row=5, column=1, columnspan=2, sticky="ew", pady=4
+    portal_group = ttk.LabelFrame(settings_tab, text=" Portal ", padding=14)
+    portal_group.pack(fill="x", pady=(0, 10))
+    portal_group.columnconfigure(1, weight=1)
+    ttk.Label(portal_group, text="Protocol").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
+    ttk.Combobox(portal_group, textvariable=scheme, values=("https", "http"), state="readonly", width=10).grid(
+        row=0, column=1, sticky="w", pady=5
     )
-    add_entry(6, "Portal host", host)
-    add_entry(7, "Portal port", port)
-    add_entry(8, "Check interval (seconds)", interval)
-    add_entry(9, "Maximum retry delay (seconds)", max_backoff)
+    ttk.Label(portal_group, text="Host or IP").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+    ttk.Entry(portal_group, textvariable=host).grid(row=1, column=1, sticky="ew", pady=5)
+    ttk.Label(portal_group, text="Port").grid(row=1, column=2, sticky="w", padx=(14, 6), pady=5)
+    ttk.Entry(portal_group, textvariable=port, width=8).grid(row=1, column=3, sticky="w", pady=5)
+    ttk.Checkbutton(
+        portal_group,
+        text="Allow the portal's self-signed HTTPS certificate",
+        variable=insecure,
+    ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(7, 2))
 
-    interface_row = 10
-    ttk.Label(frame, text="Network interface").grid(row=interface_row, column=0, sticky="w", pady=4, padx=(0, 12))
-    interface_box = ttk.Combobox(frame, textvariable=interface, state="readonly", width=31)
-    interface_box.grid(row=interface_row, column=1, sticky="ew", pady=4)
+    monitor_group = ttk.LabelFrame(settings_tab, text=" Monitoring & retry ", padding=14)
+    monitor_group.pack(fill="x", pady=(0, 10))
+    monitor_group.columnconfigure(1, weight=1)
+    ttk.Label(monitor_group, text="Network interface").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
+    interface_box = ttk.Combobox(monitor_group, textvariable=interface, state="readonly")
+    interface_box.grid(row=0, column=1, sticky="ew", pady=5)
 
     def refresh_interfaces() -> None:
-        choices = ["auto"] + active_interfaces()
-        if interface.get() not in choices:
-            choices.append(interface.get())
-        interface_box.configure(values=choices)
+        try:
+            choices = ["auto"] + active_interfaces()
+            if interface.get() not in choices:
+                choices.append(interface.get())
+            interface_box.configure(values=choices)
+        except Exception as exc:
+            messagebox.showerror("Could not list interfaces", str(exc))
 
-    ttk.Button(frame, text="Refresh", command=refresh_interfaces).grid(row=interface_row, column=2, padx=(6, 0))
+    ttk.Button(monitor_group, text="Refresh", command=refresh_interfaces).grid(row=0, column=2, padx=(8, 0), pady=5)
+    ttk.Label(monitor_group, text="Check interval").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=5)
+    ttk.Spinbox(monitor_group, from_=15, to=3600, increment=15, textvariable=interval, width=10).grid(
+        row=1, column=1, sticky="w", pady=5
+    )
+    ttk.Label(monitor_group, text="seconds", style="Hint.TLabel").grid(row=1, column=1, sticky="w", padx=(82, 0), pady=5)
+    ttk.Label(monitor_group, text="Maximum retry delay").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=5)
+    ttk.Spinbox(monitor_group, from_=30, to=3600, increment=30, textvariable=max_backoff, width=10).grid(
+        row=2, column=1, sticky="w", pady=5
+    )
+    ttk.Label(monitor_group, text="seconds", style="Hint.TLabel").grid(row=2, column=1, sticky="w", padx=(82, 0), pady=5)
+    ttk.Label(
+        monitor_group,
+        text="Auto selects an active physical Ethernet interface. Choose an adapter explicitly to override detection.",
+        style="Hint.TLabel",
+        wraplength=590,
+    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(7, 0))
     refresh_interfaces()
-    ttk.Checkbutton(frame, text="Allow the portal's self-signed HTTPS certificate", variable=insecure).grid(
-        row=interface_row + 1, column=0, columnspan=3, sticky="w", pady=(8, 4)
+
+    feedback = ttk.Frame(settings_tab, style="Surface.TFrame", padding=(12, 9))
+    feedback.pack(fill="x", pady=(0, 10))
+    ttk.Label(feedback, textvariable=feedback_value, style="StatusText.TLabel", wraplength=650).pack(anchor="w")
+    settings_actions = ttk.Frame(settings_tab, style="App.TFrame")
+    settings_actions.pack(fill="x")
+
+    # Diagnostics tab.
+    diagnostic_header = ttk.Frame(diagnostics_tab, style="App.TFrame")
+    diagnostic_header.pack(fill="x", pady=(0, 8))
+    ttk.Label(
+        diagnostic_header,
+        text="Status snapshot and recent logs. Credentials are never included.",
+        style="Subtitle.TLabel",
+    ).pack(side="left")
+    diagnostic_text = scrolledtext.ScrolledText(
+        diagnostics_tab,
+        height=22,
+        wrap="word",
+        font=("Consolas" if sys.platform == "win32" else "TkFixedFont", 9),
+        background="#101722",
+        foreground="#dbe7f7",
+        insertbackground="#ffffff",
+        relief="flat",
+        padx=12,
+        pady=12,
     )
-    ttk.Separator(frame).grid(row=interface_row + 2, column=0, columnspan=3, sticky="ew", pady=(12, 10))
-    ttk.Label(frame, textvariable=status, wraplength=520).grid(
-        row=interface_row + 3, column=0, columnspan=3, sticky="w", pady=(0, 4)
-    )
-    ttk.Label(frame, textvariable=startup_status).grid(
-        row=interface_row + 4, column=0, columnspan=3, sticky="w", pady=(0, 8)
-    )
+    diagnostic_text.pack(fill="both", expand=True)
+    diagnostic_actions = ttk.Frame(diagnostics_tab, style="App.TFrame")
+    diagnostic_actions.pack(fill="x", pady=(10, 0))
 
     def candidate_config() -> dict[str, Any]:
         return validate_config(
@@ -1173,6 +1354,10 @@ def show_setup_ui() -> int:
             require_username=True,
         )
 
+    def set_feedback(message: str, *, seconds: int = 5) -> None:
+        feedback_value.set(message)
+        feedback_override_until["value"] = time.monotonic() + seconds
+
     def save() -> bool:
         new_password = password.get()
         try:
@@ -1187,77 +1372,205 @@ def show_setup_ui() -> int:
             config.update(normalized)
             password.set("")
             request_external_check()
-            status.set("Settings saved securely. The background agent will reload them now.")
+            set_feedback("Settings saved securely. The running agent has been asked to reload them.")
             return True
         except (OSError, ValueError, RuntimeError, KeyringError) as exc:
             messagebox.showerror("Could not save", str(exc))
             return False
 
+    busy_buttons: list[Any] = []
+
+    def set_busy(busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for button in busy_buttons:
+            button.configure(state=state)
+        root.configure(cursor="watch" if busy else "")
+
+    def run_background(work, on_success, title: str) -> None:
+        set_busy(True)
+
+        def worker() -> None:
+            try:
+                result = work()
+                root.after(0, lambda: on_success(result))
+            except Exception as exc:
+                detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
+                root.after(0, lambda message=detail: messagebox.showerror(title, message))
+            finally:
+                root.after(0, lambda: set_busy(False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def install() -> None:
         if not save():
             return
-        try:
-            message = install_startup()
-            startup_status.set("Startup: installed and running")
-            status.set(message)
+
+        def installed(message: str) -> None:
+            startup_installed["value"] = True
+            startup_value.set("Starts automatically at user login")
+            set_feedback(message, seconds=8)
             messagebox.showinfo("Service installed", message)
-        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-            detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
-            messagebox.showerror("Installation failed", detail)
+
+        run_background(install_startup, installed, "Installation failed")
 
     def uninstall() -> None:
         if not messagebox.askyesno("Remove startup service", "Stop WiFi Agent and remove it from startup? Saved settings and credentials will be kept."):
             return
-        try:
-            message = uninstall_startup()
-            startup_status.set("Startup: not installed")
-            status.set(message)
+        def uninstalled(message: str) -> None:
+            startup_installed["value"] = False
+            startup_value.set("Not installed at startup")
+            set_feedback(message, seconds=8)
             messagebox.showinfo("Service removed", message)
-        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-            messagebox.showerror("Removal failed", str(exc))
+
+        run_background(uninstall_startup, uninstalled, "Removal failed")
 
     def test_now() -> None:
-        if not save():
+        try:
+            normalized = candidate_config()
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showerror("Cannot test these settings", str(exc))
             return
-        status.set("Checking Ethernet, portal port, and internet…")
+        set_feedback("Testing the selected interface, portal port, and internet access…", seconds=20)
 
-        def worker() -> None:
-            try:
-                normalized = candidate_config()
-                wired = wired_interfaces(str(normalized["network_interface"]))
-                open_ = portal_port_open(str(normalized["portal_host"]), int(normalized["portal_port"])) if wired else False
-                online = internet_available() if wired else False
-                summary = (
-                    f"Ethernet: {'connected (' + ', '.join(wired) + ')' if wired else 'not connected'} | "
-                    f"Portal port: {'open' if open_ else 'closed/unreachable'} | "
-                    f"Internet: {'available' if online else 'unavailable'}"
-                )
-                root.after(0, lambda: status.set(summary))
-            except Exception as exc:
-                root.after(0, lambda error=str(exc): messagebox.showerror("Check failed", error))
+        def work() -> tuple[list[str], bool | None, bool | None]:
+            wired = wired_interfaces(str(normalized["network_interface"]))
+            open_ = portal_port_open(str(normalized["portal_host"]), int(normalized["portal_port"])) if wired else None
+            online = internet_available() if wired else None
+            return wired, open_, online
 
-        threading.Thread(target=worker, daemon=True).start()
+        def tested(result: tuple[list[str], bool | None, bool | None]) -> None:
+            wired, open_, online = result
+            ethernet_value.set("Connected" if wired else "Disconnected")
+            portal_value.set("Open" if open_ is True else "Unreachable" if open_ is False else "Not checked")
+            internet_value.set("Available" if online is True else "Unavailable" if online is False else "Not checked")
+            set_feedback(
+                f"Test complete — interface: {', '.join(wired) if wired else 'none'}; "
+                f"portal: {portal_value.get().lower()}; internet: {internet_value.get().lower()}.",
+                seconds=10,
+            )
 
-    buttons = ttk.Frame(frame)
-    buttons.grid(row=interface_row + 5, column=0, columnspan=3, sticky="e", pady=(8, 0))
-    ttk.Button(buttons, text="Open logs", command=open_log_location).pack(side="left", padx=4)
-    ttk.Button(buttons, text="Test connection", command=test_now).pack(side="left", padx=4)
-    ttk.Button(buttons, text="Save", command=save).pack(side="left", padx=4)
-    ttk.Button(buttons, text="Remove startup", command=uninstall).pack(side="left", padx=4)
-    ttk.Button(buttons, text="Save & install", command=install).pack(side="left", padx=4)
+        run_background(work, tested, "Connection test failed")
+
+    def check_now() -> None:
+        if not agent_running["value"]:
+            messagebox.showwarning("Agent is not running", "Install or start WiFi Agent before requesting an immediate check.")
+            return
+        request_external_check()
+        set_feedback("Immediate check requested. Live status will update when the agent finishes.")
+
+    def safe_open_logs() -> None:
+        try:
+            open_log_location()
+        except OSError as exc:
+            messagebox.showerror("Could not open logs", str(exc))
+
+    def refresh_diagnostics() -> None:
+        snapshot = read_status()
+        sections = [
+            "WIFI AGENT DIAGNOSTICS",
+            "=" * 72,
+            f"Generated: {utc_now()}",
+            f"Platform: {sys.platform}",
+            f"Python: {sys.version.split()[0]}",
+            f"Startup installed: {startup_installed['value']}",
+            f"Configuration: {CONFIG_PATH}",
+            f"Log: {LOG_PATH}",
+            "",
+            "STATUS SNAPSHOT",
+            "-" * 72,
+            json.dumps(snapshot or {"message": "No status recorded"}, indent=2),
+            "",
+            "RECENT LOGS",
+            "-" * 72,
+        ]
+        if LOG_PATH.exists():
+            sections.extend(LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+        else:
+            sections.append("No log file has been created yet.")
+        diagnostic_text.configure(state="normal")
+        diagnostic_text.delete("1.0", "end")
+        diagnostic_text.insert("1.0", "\n".join(sections))
+        diagnostic_text.configure(state="disabled")
+
+    def copy_diagnostics() -> None:
+        root.clipboard_clear()
+        root.clipboard_append(diagnostic_text.get("1.0", "end-1c"))
+        set_feedback("Diagnostics copied to the clipboard.")
+
+    def on_tab_changed(event=None) -> None:
+        if notebook.select() == str(diagnostics_tab):
+            refresh_diagnostics()
+
+    notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
+    def go_to_settings() -> None:
+        notebook.select(settings_tab)
+
+    # Wire actions after functions exist.
+    install_button = ttk.Button(service_actions, text="Install / repair", command=install, style="Action.TButton")
+    install_button.pack(side="left", padx=4)
+    remove_button = ttk.Button(service_actions, text="Remove", command=uninstall, style="Action.TButton")
+    remove_button.pack(side="left", padx=4)
+    check_button = ttk.Button(quick_actions, text="Check now", command=check_now, style="Accent.TButton")
+    check_button.pack(side="left", padx=(0, 8))
+    ttk.Button(quick_actions, text="Open settings", command=go_to_settings, style="Action.TButton").pack(side="left", padx=4)
+    ttk.Button(quick_actions, text="Open logs", command=safe_open_logs, style="Action.TButton").pack(side="left", padx=4)
+
+    test_button = ttk.Button(settings_actions, text="Test connection", command=test_now, style="Action.TButton")
+    test_button.pack(side="left")
+    save_install_button = ttk.Button(settings_actions, text="Save & install", command=install, style="Accent.TButton")
+    save_install_button.pack(side="right")
+    save_button = ttk.Button(settings_actions, text="Save settings", command=save, style="Action.TButton")
+    save_button.pack(side="right", padx=(0, 8))
+
+    ttk.Button(diagnostic_actions, text="Refresh", command=refresh_diagnostics, style="Action.TButton").pack(side="left")
+    ttk.Button(diagnostic_actions, text="Copy", command=copy_diagnostics, style="Action.TButton").pack(side="left", padx=8)
+    ttk.Button(diagnostic_actions, text="Open log file", command=safe_open_logs, style="Action.TButton").pack(side="right")
+    busy_buttons.extend([install_button, remove_button, check_button, test_button, save_button, save_install_button])
 
     def refresh_status() -> None:
         snapshot = read_status()
         if snapshot:
             checked = snapshot.get("last_check_at") or "not checked yet"
-            process_id = int(snapshot.get("process_id") or 0)
-            running = bool(psutil is not None and process_id and psutil.pid_exists(process_id))
-            prefix = "Agent running" if running else "Agent not running / status stale"
-            status.set(f"{prefix}: {snapshot.get('message', 'Unknown')} · Last check: {checked}")
+            try:
+                process_id = int(snapshot.get("process_id") or 0)
+            except (TypeError, ValueError):
+                process_id = 0
+            running = snapshot_process_running(snapshot)
+            agent_running["value"] = running
+            phase = str(snapshot.get("phase", "unknown"))
+            status_title.set(str(snapshot.get("message", "Unknown")))
+            status_detail.set(f"Phase: {phase} · Process ID: {process_id or 'unknown'}")
+            runtime_value.set("Agent running" if running else "Agent not running")
+            startup_value.set("Starts automatically at user login" if startup_installed["value"] else "Not installed at startup")
+            last_check_value.set(f"Last checked: {checked}")
+            interfaces = snapshot.get("interfaces") or []
+            ethernet_value.set("Connected" if snapshot.get("ethernet_connected") else "Disconnected")
+            if interfaces:
+                ethernet_value.set(f"Connected · {', '.join(str(value) for value in interfaces)}")
+            port_state = snapshot.get("portal_port_open")
+            portal_value.set("Open" if port_state is True else "Unreachable" if port_state is False else "Not checked")
+            internet_state = snapshot.get("internet_available")
+            internet_value.set("Available" if internet_state is True else "Unavailable" if internet_state is False else "Not checked")
+            dot_color = (
+                colors["success"] if phase == "online" else
+                colors["warning"] if phase in {"offline", "backoff", "paused"} else
+                colors["danger"] if phase in {"error", "needs-setup"} else
+                colors["idle"]
+            )
+            status_dot.itemconfigure(status_dot_id, fill=dot_color)
+            if time.monotonic() >= feedback_override_until["value"]:
+                feedback_value.set(str(snapshot.get("message", "Status unavailable")))
+        else:
+            agent_running["value"] = False
+            status_title.set("No status recorded")
+            status_detail.set("Install or start WiFi Agent to begin monitoring.")
+            runtime_value.set("Agent not running")
+            startup_value.set("Starts automatically at user login" if startup_installed["value"] else "Not installed at startup")
         root.after(2000, refresh_status)
 
-    startup_status.set(f"Startup: {'installed' if startup_is_installed() else 'not installed'}")
     refresh_status()
+    refresh_diagnostics()
     if configuration_warning:
         root.after(100, lambda: messagebox.showwarning("Configuration needs repair", configuration_warning))
 
@@ -1267,8 +1580,7 @@ def show_setup_ui() -> int:
 
 def print_status(*, json_output: bool = False, log_lines: int = 10) -> int:
     snapshot = read_status()
-    process_id = int((snapshot or {}).get("process_id") or 0)
-    running = bool(psutil is not None and process_id and psutil.pid_exists(process_id))
+    running = snapshot_process_running(snapshot)
     if json_output:
         payload = snapshot or {"phase": "unknown", "message": "No status has been recorded"}
         payload = {**payload, "process_running": running, "startup_installed": startup_is_installed()}
