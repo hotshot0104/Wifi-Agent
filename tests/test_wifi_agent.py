@@ -49,6 +49,9 @@ class ConfigTests(unittest.TestCase):
                 if sys.platform != "win32":
                     self.assertEqual((root / "config.json").stat().st_mode & 0o777, 0o600)
 
+    def test_malformed_status_pid_is_treated_as_not_running(self) -> None:
+        self.assertFalse(app.snapshot_process_running({"process_id": "not-a-pid"}))
+
 
 class PortalTests(unittest.TestCase):
     def test_namespaced_xml_is_understood(self) -> None:
