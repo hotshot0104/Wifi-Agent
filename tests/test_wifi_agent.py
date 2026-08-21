@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import plistlib
 import sys
 import tempfile
 import types
@@ -51,6 +52,16 @@ class ConfigTests(unittest.TestCase):
 
     def test_malformed_status_pid_is_treated_as_not_running(self) -> None:
         self.assertFalse(app.snapshot_process_running({"process_id": "not-a-pid"}))
+
+    def test_ui_pane_state_is_private_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "ui-state.json"
+            with patch.object(app, "app_dir", return_value=root), patch.object(app, "UI_STATE_PATH", state_path):
+                app.save_ui_state({"last_pane": "diagnostics"})
+                self.assertEqual(app.load_ui_state()["last_pane"], "diagnostics")
+                if sys.platform != "win32":
+                    self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
 
 
 class PortalTests(unittest.TestCase):
@@ -178,6 +189,26 @@ class StartupTests(unittest.TestCase):
             self.assertIn("tray", arguments)
             self.assertIsNotNone(task.find(".//t:RestartOnFailure", namespace))
             self.assertEqual(task.findtext(".//t:MultipleInstancesPolicy", namespaces=namespace), "IgnoreNew")
+
+    def test_macos_launch_agent_runs_menu_bar_and_stays_quit_after_clean_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_result = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            with (
+                patch.object(app.sys, "platform", "darwin"),
+                patch.object(app.Path, "home", return_value=root),
+                patch.object(app, "app_dir", return_value=root / "config"),
+                patch.object(app, "load_config", return_value=app.validate_config({"username": "student"})),
+                patch.object(app, "get_password", return_value="secret"),
+                patch.object(app.subprocess, "run", return_value=fake_result),
+            ):
+                app.install_startup()
+
+            plist_path = root / "Library" / "LaunchAgents" / "com.local.wifi-agent.plist"
+            with plist_path.open("rb") as handle:
+                payload = plistlib.load(handle)
+            self.assertEqual(payload["ProgramArguments"][-1], "tray")
+            self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
 
 
 if __name__ == "__main__":
