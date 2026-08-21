@@ -4,15 +4,22 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import AbstractContextManager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 import getpass
 from html import escape as xml_escape
+import ipaddress
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import plistlib
+import random
+import re
+import signal
 import socket
 import ssl
 import subprocess
@@ -22,12 +29,12 @@ import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 try:
     import keyring
     from keyring.errors import KeyringError, NoKeyringError
-except ImportError:  # Helpful error before bootstrap has installed dependencies.
+except ImportError:  # Helpful error before the installer has installed dependencies.
     keyring = None
     KeyringError = NoKeyringError = Exception
 
@@ -41,11 +48,14 @@ APP_NAME = "WiFiAgent"
 KEYRING_SERVICE = "WiFi Agent"
 DEFAULT_CONFIG: dict[str, Any] = {
     "username": "",
+    "portal_scheme": "https",
     "portal_host": "192.168.1.2",
     "portal_port": 8090,
     "check_interval_seconds": 45,
+    "login_backoff_max_seconds": 600,
     "network_interface": "auto",
     "allow_self_signed_portal": True,
+    "config_revision": 0,
 }
 
 
@@ -61,13 +71,83 @@ def app_dir() -> Path:
 
 CONFIG_PATH = app_dir() / "config.json"
 LOG_PATH = app_dir() / "agent.log"
+STATUS_PATH = app_dir() / "status.json"
+LOCK_PATH = app_dir() / "agent.lock"
+WAKE_PATH = app_dir() / "check.request"
+WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def ensure_dependencies() -> None:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _portal_authority(host: str, port: int) -> str:
+    try:
+        address = ipaddress.ip_address(host)
+        rendered_host = f"[{host}]" if address.version == 6 else host
+    except ValueError:
+        rendered_host = host
+    return f"{rendered_host}:{port}"
+
+
+def validate_config(candidate: dict[str, Any], *, require_username: bool = False) -> dict[str, Any]:
+    """Return a normalized configuration or raise a user-facing ValueError."""
+    config = DEFAULT_CONFIG.copy()
+    config.update({key: value for key, value in candidate.items() if key in DEFAULT_CONFIG})
+    username = str(config.get("username", "")).strip()
+    if require_username and not username:
+        raise ValueError("Portal username is required.")
+    if len(username) > 256 or any(ord(char) < 32 for char in username):
+        raise ValueError("Portal username contains unsupported characters.")
+
+    scheme = str(config.get("portal_scheme", "https")).strip().casefold()
+    if scheme not in {"http", "https"}:
+        raise ValueError("Portal protocol must be HTTP or HTTPS.")
+    host = str(config.get("portal_host", "")).strip().rstrip(".")
+    if not host or len(host) > 253 or any(char.isspace() for char in host) or "/" in host or "://" in host:
+        raise ValueError("Enter only a valid portal hostname or IP address, without a URL path.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", host):
+            raise ValueError("Portal hostname is not valid.")
+
+    try:
+        port = int(config.get("portal_port", 0))
+        interval = int(config.get("check_interval_seconds", 0))
+        max_backoff = int(config.get("login_backoff_max_seconds", 0))
+        revision = int(config.get("config_revision", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Port, interval, and retry limit must be whole numbers.") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("Portal port must be between 1 and 65535.")
+    if not 15 <= interval <= 3600:
+        raise ValueError("Check interval must be between 15 and 3600 seconds.")
+    if not 30 <= max_backoff <= 3600:
+        raise ValueError("Maximum login retry delay must be between 30 and 3600 seconds.")
+    interface = str(config.get("network_interface", "auto")).strip() or "auto"
+    if len(interface) > 256 or any(ord(char) < 32 for char in interface):
+        raise ValueError("Network interface name is not valid.")
+
+    return {
+        "username": username,
+        "portal_scheme": scheme,
+        "portal_host": host,
+        "portal_port": port,
+        "check_interval_seconds": interval,
+        "login_backoff_max_seconds": max_backoff,
+        "network_interface": interface,
+        "allow_self_signed_portal": bool(config.get("allow_self_signed_portal", True)),
+        "config_revision": revision,
+    }
+
+
+def ensure_dependencies(*required: str) -> None:
+    required = required or ("keyring", "psutil")
     missing = []
-    if keyring is None:
+    if "keyring" in required and keyring is None:
         missing.append("keyring")
-    if psutil is None:
+    if "psutil" in required and psutil is None:
         missing.append("psutil")
     if missing:
         raise SystemExit(
@@ -85,21 +165,47 @@ def load_config() -> dict[str, Any]:
                 config.update(saved)
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Cannot read {CONFIG_PATH}: {exc}") from exc
-    return config
+    return validate_config(config)
 
 
 def save_config(config: dict[str, Any]) -> None:
+    config = validate_config(config)
+    config["config_revision"] = time.time_ns()
     app_dir().mkdir(parents=True, exist_ok=True)
-    public_config = {key: config[key] for key in DEFAULT_CONFIG if key in config}
     temporary = CONFIG_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(public_config, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     if os.name != "nt":
         temporary.chmod(0o600)
     temporary.replace(CONFIG_PATH)
 
 
+def write_status(status: dict[str, Any]) -> None:
+    app_dir().mkdir(parents=True, exist_ok=True)
+    temporary = STATUS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    if os.name != "nt":
+        temporary.chmod(0o600)
+    temporary.replace(STATUS_PATH)
+
+
+def read_status() -> dict[str, Any] | None:
+    try:
+        value = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def request_external_check() -> None:
+    app_dir().mkdir(parents=True, exist_ok=True)
+    temporary = WAKE_PATH.with_suffix(".tmp")
+    temporary.write_text(str(time.time_ns()), encoding="ascii")
+    temporary.replace(WAKE_PATH)
+
+
 def credential_backend_ready() -> tuple[bool, str]:
-    ensure_dependencies()
+    if keyring is None:
+        return False, "The keyring package is not installed."
     try:
         backend = keyring.get_keyring()
         priority = getattr(backend, "priority", 0)
@@ -129,7 +235,7 @@ def store_credentials(username: str, password: str, old_username: str = "") -> N
 
 
 def get_password(username: str) -> str:
-    ensure_dependencies()
+    ensure_dependencies("keyring")
     try:
         password = keyring.get_password(KEYRING_SERVICE, username)
     except (KeyringError, NoKeyringError) as exc:
@@ -141,7 +247,7 @@ def get_password(username: str) -> str:
 
 def active_interfaces() -> list[str]:
     """Return active, non-loopback interfaces that currently own an IPv4 address."""
-    ensure_dependencies()
+    ensure_dependencies("psutil")
     try:
         stats = psutil.net_if_stats()
         address_map = psutil.net_if_addrs()
@@ -197,7 +303,7 @@ def _fallback_active_interfaces() -> list[str]:
         try:
             output = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-                check=True, capture_output=True, text=True, timeout=8,
+                check=True, capture_output=True, text=True, timeout=8, creationflags=WINDOWS_NO_WINDOW,
             ).stdout
             return sorted((line.strip() for line in output.splitlines() if line.strip()), key=str.casefold)
         except (OSError, subprocess.SubprocessError):
@@ -270,11 +376,20 @@ INTERNET_PROBES = (
 )
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
 def internet_available(timeout: float = 5.0) -> bool:
+    # Captive portals commonly return a redirect or a branded HTTP 200 page.
+    # Refusing redirects and checking exact response fingerprints prevents both
+    # from being mistaken for working internet access.
+    opener = build_opener(_NoRedirect(), HTTPSHandler(context=ssl.create_default_context()))
     for url, expected_status, expected_body in INTERNET_PROBES:
         try:
             request = Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"})
-            with urlopen(request, timeout=timeout) as response:
+            with opener.open(request, timeout=timeout) as response:
                 body = response.read(256)
                 if response.status == expected_status and (
                     expected_body is None or expected_body in body
@@ -289,17 +404,23 @@ class PortalClient:
     def __init__(self, config: dict[str, Any], password: str):
         self.username = str(config["username"])
         self.password = password
+        self.scheme = str(config.get("portal_scheme", "https"))
         self.host = str(config["portal_host"])
         self.port = int(config["portal_port"])
-        self.base_url = f"https://{self.host}:{self.port}"
+        self.base_url = f"{self.scheme}://{_portal_authority(self.host, self.port)}"
         self.ssl_context = ssl.create_default_context()
         if config.get("allow_self_signed_portal", True):
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
+        self.opener = build_opener(HTTPSHandler(context=self.ssl_context))
 
     def _request(self, request: Request, timeout: float = 10.0) -> str:
-        with urlopen(request, timeout=timeout, context=self.ssl_context) as response:
+        with self.opener.open(request, timeout=timeout) as response:
             return response.read(64 * 1024).decode("utf-8", errors="replace")
+
+    def _safe_message(self, message: str) -> str:
+        value = message.replace(self.password, "[redacted]") if self.password else message
+        return " ".join(value.split())[:300]
 
     @staticmethod
     def _response_summary(text: str) -> tuple[bool, str]:
@@ -309,8 +430,13 @@ class PortalClient:
         message = ""
         try:
             root = ET.fromstring(text)
-            status = (root.findtext(".//status") or "").strip()
-            message = (root.findtext(".//message") or "").strip()
+            for element in root.iter():
+                tag = element.tag.rsplit("}", 1)[-1].casefold() if isinstance(element.tag, str) else ""
+                value = (element.text or "").strip()
+                if tag == "status" and not status:
+                    status = value
+                elif tag == "message" and not message:
+                    message = value
         except ET.ParseError:
             pass
         combined = " ".join(part for part in (status, message) if part) or "HTTP response received"
@@ -334,14 +460,18 @@ class PortalClient:
             method="POST",
         )
         try:
-            return self._response_summary(self._request(request))
+            success, message = self._response_summary(self._request(request))
+            return success, self._safe_message(message)
         except (HTTPError, URLError, OSError, TimeoutError, ssl.SSLError) as exc:
             return False, str(exc)
 
     def keep_alive(self) -> tuple[bool, str]:
         url = f"{self.base_url}/live?mode=192&username={quote(self.username, safe='')}"
         try:
-            return self._response_summary(self._request(Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"}), 8))
+            success, message = self._response_summary(
+                self._request(Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"}), 8)
+            )
+            return success, self._safe_message(message)
         except (HTTPError, URLError, OSError, TimeoutError, ssl.SSLError) as exc:
             return False, str(exc)
 
@@ -363,70 +493,439 @@ def build_logger(console: bool = True) -> logging.Logger:
     return logger
 
 
+@dataclass
+class AgentSnapshot:
+    phase: str = "starting"
+    message: str = "Agent is starting"
+    ethernet_connected: bool = False
+    interfaces: tuple[str, ...] = ()
+    portal_port_open: bool | None = None
+    internet_available: bool | None = None
+    paused: bool = False
+    last_check_at: str | None = None
+    last_login_at: str | None = None
+    consecutive_login_failures: int = 0
+    retry_in_seconds: int = 0
+    process_id: int = 0
+    started_at: str | None = None
+
+
+class SingleInstance(AbstractContextManager):
+    """A process-scoped lock that is released automatically after crashes."""
+
+    def __init__(self) -> None:
+        self._handle: Any = None
+        self._kernel32: Any = None
+        self._file: Any = None
+
+    def __enter__(self):
+        app_dir().mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            self._kernel32 = kernel32
+            self._handle = kernel32.CreateMutexW(None, False, "Local\\WiFiAgent.Monitor")
+            if not self._handle:
+                raise RuntimeError("Could not create the Windows single-instance mutex.")
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                kernel32.CloseHandle(self._handle)
+                self._handle = None
+                raise RuntimeError("WiFi Agent is already running.")
+            return self
+
+        import fcntl
+
+        self._file = LOCK_PATH.open("a+", encoding="ascii")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._file.close()
+            self._file = None
+            raise RuntimeError("WiFi Agent is already running.") from exc
+        self._file.seek(0)
+        self._file.truncate()
+        self._file.write(str(os.getpid()))
+        self._file.flush()
+        if os.name != "nt":
+            LOCK_PATH.chmod(0o600)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+            self._kernel32 = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+
+class AgentMonitor:
+    """Resilient monitoring loop shared by console and Windows tray modes."""
+
+    def __init__(self, logger: logging.Logger | None = None, status_callback=None):
+        self.logger = logger or build_logger(console=sys.stderr is not None and sys.stderr.isatty())
+        self.status_callback = status_callback
+        self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.snapshot = AgentSnapshot(process_id=os.getpid(), started_at=utc_now())
+        self._snapshot_lock = threading.Lock()
+        self._client: PortalClient | None = None
+        self._config: dict[str, Any] | None = None
+        self._config_signature = ""
+        self._last_logged_state: tuple[Any, ...] | None = None
+        self._login_failures = 0
+        self._next_login_at = 0.0
+        self._keepalive_failures = 0
+
+    def current_snapshot(self) -> AgentSnapshot:
+        with self._snapshot_lock:
+            return AgentSnapshot(**asdict(self.snapshot))
+
+    def _publish(self, **changes: Any) -> None:
+        with self._snapshot_lock:
+            for key, value in changes.items():
+                setattr(self.snapshot, key, value)
+            payload = asdict(self.snapshot)
+        try:
+            write_status(payload)
+        except OSError as exc:
+            self.logger.debug("Could not write status file: %s", exc)
+        if self.status_callback:
+            try:
+                self.status_callback(self.current_snapshot())
+            except Exception as exc:
+                self.logger.debug("Status callback failed: %s", exc)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake_event.set()
+
+    def request_check(self) -> None:
+        self.wake_event.set()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self.pause_event.set()
+        else:
+            self.pause_event.clear()
+        self._publish(paused=paused, phase="paused" if paused else "checking", message="Monitoring paused" if paused else "Monitoring resumed")
+        self.wake_event.set()
+
+    def _load_client(self) -> tuple[dict[str, Any], PortalClient]:
+        config = validate_config(load_config(), require_username=True)
+        signature = json.dumps(config, sort_keys=True, separators=(",", ":"))
+        if signature != self._config_signature or self._client is None:
+            password = get_password(str(config["username"]))
+            self._client = PortalClient(config, password)
+            self._config = config
+            self._config_signature = signature
+            self._login_failures = 0
+            self._next_login_at = 0.0
+            self.logger.info(
+                "Configuration loaded; portal=%s interface=%s",
+                self._client.base_url,
+                config["network_interface"],
+            )
+        return config, self._client
+
+    def _schedule_login_retry(self, config: dict[str, Any]) -> int:
+        self._login_failures += 1
+        base = max(30, int(config["check_interval_seconds"]))
+        ceiling = int(config["login_backoff_max_seconds"])
+        delay = min(ceiling, base * (2 ** min(self._login_failures - 1, 8)))
+        delay = min(ceiling, max(30, int(delay * random.uniform(0.9, 1.1))))
+        self._next_login_at = time.monotonic() + delay
+        return delay
+
+    def _reset_login_backoff(self) -> None:
+        self._login_failures = 0
+        self._next_login_at = 0.0
+
+    def check_once(self) -> bool:
+        if self.pause_event.is_set():
+            self._publish(phase="paused", message="Monitoring paused", paused=True)
+            return False
+
+        try:
+            config, client = self._load_client()
+        except (OSError, RuntimeError, ValueError) as exc:
+            message = str(exc)
+            if message != self.snapshot.message:
+                self.logger.warning("Configuration/credential problem: %s", message)
+            self._publish(
+                phase="needs-setup",
+                message=message,
+                ethernet_connected=False,
+                interfaces=(),
+                portal_port_open=None,
+                internet_available=None,
+                last_check_at=utc_now(),
+            )
+            return False
+
+        interfaces = wired_interfaces(str(config["network_interface"]))
+        ethernet = bool(interfaces)
+        port_open = portal_port_open(client.host, client.port) if ethernet else None
+        online = internet_available() if ethernet else None
+        state = (tuple(interfaces), port_open, online)
+        if state != self._last_logged_state:
+            self.logger.info(
+                "Status: ethernet=%s (%s), portal-port=%s, internet=%s",
+                "connected" if ethernet else "disconnected",
+                ", ".join(interfaces) if interfaces else "none",
+                "open" if port_open is True else "closed/unreachable" if port_open is False else "not checked",
+                "available" if online is True else "unavailable" if online is False else "not checked",
+            )
+            self._last_logged_state = state
+
+        phase = "online" if online else "offline"
+        message = "Internet available" if online else "Internet unavailable"
+        retry_in = max(0, int(self._next_login_at - time.monotonic()))
+
+        if ethernet and port_open and online:
+            self._reset_login_backoff()
+            ok, keepalive_message = client.keep_alive()
+            if ok:
+                self._keepalive_failures = 0
+            else:
+                self._keepalive_failures += 1
+                if self._keepalive_failures == 1 or self._keepalive_failures % 5 == 0:
+                    self.logger.warning("Portal keep-alive was not acknowledged: %s", keepalive_message)
+
+        elif ethernet and port_open and not online:
+            now = time.monotonic()
+            if now >= self._next_login_at:
+                self.logger.info("Ethernet and portal are reachable; attempting portal login")
+                ok, login_message = client.login()
+                if ok:
+                    self.logger.info("Portal login accepted: %s", login_message)
+                    self._publish(last_login_at=utc_now())
+                    if not self.stop_event.wait(3):
+                        online = internet_available()
+                    if online:
+                        self._reset_login_backoff()
+                        phase = "online"
+                        message = "Login succeeded; internet available"
+                        self.logger.info("Internet became available after portal login")
+                    else:
+                        delay = self._schedule_login_retry(config)
+                        retry_in = delay
+                        message = f"Login accepted but internet is unavailable; retrying in {delay}s"
+                        self.logger.warning(message)
+                else:
+                    delay = self._schedule_login_retry(config)
+                    retry_in = delay
+                    message = f"Login failed; retrying in {delay}s"
+                    self.logger.warning("%s: %s", message, login_message)
+            else:
+                phase = "backoff"
+                message = f"Waiting {retry_in}s before the next login attempt"
+        elif ethernet and not port_open:
+            message = "Ethernet connected; portal port is unreachable"
+            self._reset_login_backoff()
+        else:
+            message = "Waiting for the selected Ethernet interface"
+            self._reset_login_backoff()
+
+        self._publish(
+            phase=phase,
+            message=message,
+            ethernet_connected=ethernet,
+            interfaces=tuple(interfaces),
+            portal_port_open=port_open,
+            internet_available=online,
+            paused=False,
+            last_check_at=utc_now(),
+            consecutive_login_failures=self._login_failures,
+            retry_in_seconds=retry_in,
+        )
+        return bool(online)
+
+    def run(self, once: bool = False) -> int:
+        self.logger.info("Agent monitor started")
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    online = self.check_once()
+                except Exception:
+                    self.logger.exception("Unexpected monitor-cycle error; the agent will continue")
+                    self._publish(phase="error", message="Unexpected monitoring error; see logs", last_check_at=utc_now())
+                    online = False
+                if once:
+                    return 0 if online else 1
+                interval = int((self._config or DEFAULT_CONFIG)["check_interval_seconds"])
+                deadline = time.monotonic() + interval
+                while not self.stop_event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or self.wake_event.wait(min(1.0, remaining)):
+                        self.wake_event.clear()
+                        break
+                    if WAKE_PATH.exists():
+                        try:
+                            WAKE_PATH.unlink()
+                        except OSError:
+                            pass
+                        break
+        finally:
+            self.logger.info("Agent monitor stopped")
+        return 0
+
+
 def run_agent(once: bool = False) -> int:
     ensure_dependencies()
-    config = load_config()
-    username = str(config.get("username", "")).strip()
-    if not username:
-        print("No credentials configured. Run: python wifi_agent.py setup", file=sys.stderr)
-        return 2
+    monitor = AgentMonitor()
+    with SingleInstance():
+        previous_handlers: dict[int, Any] = {}
+
+        def stop_handler(signum, frame) -> None:
+            monitor.stop()
+
+        for signal_name in ("SIGINT", "SIGTERM"):
+            signal_value = getattr(signal, signal_name, None)
+            if signal_value is not None:
+                previous_handlers[signal_value] = signal.getsignal(signal_value)
+                signal.signal(signal_value, stop_handler)
+        try:
+            return monitor.run(once=once)
+        finally:
+            for signal_value, handler in previous_handlers.items():
+                signal.signal(signal_value, handler)
+
+
+def open_log_location() -> None:
+    app_dir().mkdir(parents=True, exist_ok=True)
+    target = LOG_PATH if LOG_PATH.exists() else app_dir()
+    if sys.platform == "win32":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(target)], start_new_session=True)
+    else:
+        subprocess.Popen(["xdg-open", str(target)], start_new_session=True)
+
+
+def spawn_setup_window() -> None:
+    executable = Path(sys.executable)
+    if sys.platform == "win32":
+        pythonw = executable.with_name("pythonw.exe")
+        if pythonw.exists():
+            executable = pythonw
+    subprocess.Popen(
+        [str(executable), str(Path(__file__).resolve()), "setup"],
+        cwd=str(Path(__file__).resolve().parent),
+        start_new_session=True,
+    )
+
+
+def _tray_image():
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((4, 4, 60, 60), radius=15, fill=(22, 101, 216, 255))
+    draw.arc((14, 16, 50, 50), 215, 325, fill="white", width=5)
+    draw.arc((21, 25, 43, 47), 215, 325, fill="white", width=5)
+    draw.ellipse((29, 42, 35, 48), fill="white")
+    return image
+
+
+def run_tray() -> int:
+    if sys.platform != "win32":
+        raise RuntimeError("The tray interface is currently supported on Windows only.")
+    ensure_dependencies()
     try:
-        password = get_password(username)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+        import pystray
+    except ImportError as exc:
+        raise RuntimeError("Tray dependencies are missing. Run install.cmd again.") from exc
 
-    logger = build_logger(console=sys.stderr is not None and sys.stderr.isatty())
-    client = PortalClient(config, password)
-    interval = max(15, int(config.get("check_interval_seconds", 45)))
-    selected_interface = str(config.get("network_interface", "auto"))
-    last_state: tuple[Any, ...] | None = None
-    last_login_attempt = 0.0
-    logger.info("Agent started; portal=%s:%s interface=%s", client.host, client.port, selected_interface)
+    logger = build_logger(console=False)
+    monitor_holder: dict[str, AgentMonitor] = {}
+    icon_holder: dict[str, Any] = {}
+    last_phase = {"value": ""}
 
-    try:
-        while True:
-            wired = wired_interfaces(selected_interface)
-            port_open = portal_port_open(client.host, client.port) if wired else False
-            online = internet_available() if wired else False
-            state = (tuple(wired), port_open, online)
-            if state != last_state:
-                logger.info(
-                    "Status: ethernet=%s (%s), portal-port=%s, internet=%s",
-                    "connected" if wired else "disconnected",
-                    ", ".join(wired) if wired else "none",
-                    "open" if port_open else "closed/unreachable",
-                    "available" if online else "unavailable",
-                )
-                last_state = state
+    def on_status(snapshot: AgentSnapshot) -> None:
+        icon = icon_holder.get("icon")
+        if icon is None:
+            return
+        icon.title = f"WiFi Agent — {snapshot.message}"[:127]
+        try:
+            icon.update_menu()
+        except Exception:
+            pass
+        if snapshot.phase in {"needs-setup", "error"} and snapshot.phase != last_phase["value"]:
+            try:
+                icon.notify(snapshot.message, "WiFi Agent needs attention")
+            except Exception:
+                pass
+        last_phase["value"] = snapshot.phase
 
-            if wired and port_open:
-                if online:
-                    ok, message = client.keep_alive()
-                    if not ok:
-                        logger.warning("Portal keep-alive was not acknowledged: %s", message)
-                elif time.monotonic() - last_login_attempt >= max(30, interval):
-                    last_login_attempt = time.monotonic()
-                    logger.info("Ethernet is connected but internet is unavailable; attempting portal login")
-                    ok, message = client.login()
-                    if ok:
-                        logger.info("Portal login accepted: %s", message)
-                        time.sleep(3)
-                        if internet_available():
-                            online = True
-                            logger.info("Internet became available after portal login")
-                            last_state = None
-                        else:
-                            logger.warning("Login was accepted, but internet is still unavailable")
-                    else:
-                        logger.warning("Portal login rejected/failed: %s", message)
+    monitor = AgentMonitor(logger=logger, status_callback=on_status)
+    monitor_holder["monitor"] = monitor
 
-            if once:
-                return 0 if online else 1
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        logger.info("Agent stopped")
-        return 0
+    def snapshot() -> AgentSnapshot:
+        return monitor_holder["monitor"].current_snapshot()
+
+    def open_settings(icon, item) -> None:
+        try:
+            spawn_setup_window()
+        except OSError as exc:
+            icon.notify(str(exc), "Could not open settings")
+
+    def check_now(icon, item) -> None:
+        monitor.request_check()
+        try:
+            icon.notify("A connectivity and portal check has been requested.", "WiFi Agent")
+        except Exception:
+            pass
+
+    def toggle_pause(icon, item) -> None:
+        monitor.set_paused(not monitor.pause_event.is_set())
+
+    def pause_label(item) -> str:
+        return "Resume monitoring" if monitor.pause_event.is_set() else "Pause monitoring"
+
+    def status_label(item) -> str:
+        return f"Status: {snapshot().message}"[:80]
+
+    def open_logs(icon, item) -> None:
+        try:
+            open_log_location()
+        except OSError as exc:
+            icon.notify(str(exc), "Could not open logs")
+
+    def quit_agent(icon, item) -> None:
+        monitor.stop()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open WiFi Agent", open_settings, default=True),
+        pystray.MenuItem(status_label, lambda icon, item: None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Check and log in now", check_now),
+        pystray.MenuItem(pause_label, toggle_pause),
+        pystray.MenuItem("Open logs", open_logs),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit until next login", quit_agent),
+    )
+    icon = pystray.Icon(APP_NAME, _tray_image(), "WiFi Agent — starting", menu)
+    icon_holder["icon"] = icon
+
+    with SingleInstance():
+        worker = threading.Thread(target=monitor.run, name="wifi-agent-monitor", daemon=True)
+        worker.start()
+        try:
+            icon.run()
+        finally:
+            monitor.stop()
+            worker.join(timeout=15)
+    return 0
 
 
 def _service_command() -> list[str]:
@@ -435,7 +934,8 @@ def _service_command() -> list[str]:
         pythonw = executable.with_name("pythonw.exe")
         if pythonw.exists():
             executable = pythonw
-    return [str(executable), str(Path(__file__).resolve()), "run"]
+    mode = "tray" if sys.platform == "win32" else "run"
+    return [str(executable), str(Path(__file__).resolve()), mode]
 
 
 def install_startup() -> str:
@@ -478,11 +978,20 @@ def install_startup() -> str:
         try:
             subprocess.run(
                 ["schtasks", "/Create", "/TN", APP_NAME, "/XML", str(task_xml), "/F"],
-                check=True, capture_output=True, text=True,
+                check=True, capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
             )
         finally:
             task_xml.unlink(missing_ok=True)
-        subprocess.run(["schtasks", "/Run", "/TN", APP_NAME], check=True, capture_output=True, text=True)
+        # Stop an older headless/tray version so the replacement starts now
+        # instead of waiting for the next Windows sign-in.
+        subprocess.run(
+            ["schtasks", "/End", "/TN", APP_NAME],
+            capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
+        )
+        subprocess.run(
+            ["schtasks", "/Run", "/TN", APP_NAME],
+            check=True, capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
+        )
         return f"Windows startup task '{APP_NAME}' installed and started."
 
     if sys.platform == "darwin":
@@ -519,7 +1028,8 @@ def install_startup() -> str:
         encoding="utf-8",
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, capture_output=True, text=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", target.name], check=True, capture_output=True, text=True)
+    subprocess.run(["systemctl", "--user", "enable", target.name], check=True, capture_output=True, text=True)
+    subprocess.run(["systemctl", "--user", "restart", target.name], check=True, capture_output=True, text=True)
     return f"Linux systemd user service installed at {target} and started."
 
 
@@ -527,9 +1037,29 @@ def _systemd_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def startup_is_installed() -> bool:
+    if sys.platform == "win32":
+        return subprocess.run(
+            ["schtasks", "/Query", "/TN", APP_NAME],
+            capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
+        ).returncode == 0
+    if sys.platform == "darwin":
+        return (Path.home() / "Library" / "LaunchAgents" / "com.local.wifi-agent.plist").exists()
+    return (Path.home() / ".config" / "systemd" / "user" / "wifi-agent.service").exists()
+
+
 def uninstall_startup() -> str:
     if sys.platform == "win32":
-        subprocess.run(["schtasks", "/Delete", "/TN", APP_NAME, "/F"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["schtasks", "/End", "/TN", APP_NAME],
+            capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
+        )
+        result = subprocess.run(
+            ["schtasks", "/Delete", "/TN", APP_NAME, "/F"],
+            capture_output=True, text=True, creationflags=WINDOWS_NO_WINDOW,
+        )
+        if result.returncode != 0 and startup_is_installed():
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Could not remove the startup task.")
         return f"Windows startup task '{APP_NAME}' removed. Saved settings were kept."
     if sys.platform == "darwin":
         target = Path.home() / "Library" / "LaunchAgents" / "com.local.wifi-agent.plist"
@@ -554,76 +1084,112 @@ def show_setup_ui() -> int:
         print("Tkinter is not installed. On Debian/Ubuntu, install python3-tk, then retry.", file=sys.stderr)
         return 2
 
-    config = load_config()
+    configuration_warning = ""
+    try:
+        config = load_config()
+    except (OSError, RuntimeError, ValueError) as exc:
+        config = validate_config(DEFAULT_CONFIG)
+        configuration_warning = f"The saved configuration could not be loaded and must be repaired: {exc}"
     root = tk.Tk()
-    root.title("Cyberoam Auto Login")
+    root.title("WiFi Agent")
     root.resizable(False, False)
-    frame = ttk.Frame(root, padding=18)
+    frame = ttk.Frame(root, padding=20)
     frame.grid()
 
     username = tk.StringVar(value=str(config["username"]))
     password = tk.StringVar()
+    scheme = tk.StringVar(value=str(config.get("portal_scheme", "https")))
     host = tk.StringVar(value=str(config["portal_host"]))
     port = tk.StringVar(value=str(config["portal_port"]))
     interval = tk.StringVar(value=str(config["check_interval_seconds"]))
+    max_backoff = tk.StringVar(value=str(config["login_backoff_max_seconds"]))
     interface = tk.StringVar(value=str(config.get("network_interface", "auto")))
     insecure = tk.BooleanVar(value=bool(config.get("allow_self_signed_portal", True)))
-    status = tk.StringVar(value="Password is stored only in your operating system's credential vault.")
+    status = tk.StringVar(value="Loading agent status…")
+    startup_status = tk.StringVar(value="")
 
-    fields = (
-        ("Username / roll number", username, False),
-        ("Password", password, True),
-        ("Portal host", host, False),
-        ("Portal port", port, False),
-        ("Check every (seconds)", interval, False),
+    ttk.Label(frame, text="WiFi Agent", font=("TkDefaultFont", 15, "bold")).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 3)
     )
-    for row, (label, variable, secret) in enumerate(fields):
+    ttk.Label(
+        frame,
+        text="Secure Sophos/Cyberoam connectivity monitoring and session recovery",
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+    def add_entry(row: int, label: str, variable, secret: bool = False) -> None:
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 12))
-        ttk.Entry(frame, textvariable=variable, show="*" if secret else "", width=34).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Entry(frame, textvariable=variable, show="*" if secret else "", width=38).grid(
+            row=row, column=1, columnspan=2, sticky="ew", pady=4
+        )
 
-    ttk.Label(frame, text="Wired interface").grid(row=5, column=0, sticky="w", pady=4, padx=(0, 12))
-    choices = ["auto"] + active_interfaces()
-    if interface.get() not in choices:
-        choices.append(interface.get())
-    ttk.Combobox(frame, textvariable=interface, values=choices, state="readonly", width=31).grid(row=5, column=1, sticky="ew", pady=4)
-    ttk.Checkbutton(frame, text="Allow the portal's self-signed HTTPS certificate", variable=insecure).grid(
-        row=6, column=0, columnspan=2, sticky="w", pady=(8, 4)
+    add_entry(3, "Username / roll number", username)
+    add_entry(4, "Password", password, True)
+    ttk.Label(frame, text="Portal protocol").grid(row=5, column=0, sticky="w", pady=4, padx=(0, 12))
+    ttk.Combobox(frame, textvariable=scheme, values=("https", "http"), state="readonly", width=35).grid(
+        row=5, column=1, columnspan=2, sticky="ew", pady=4
     )
-    ttk.Label(frame, textvariable=status, wraplength=430).grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 8))
+    add_entry(6, "Portal host", host)
+    add_entry(7, "Portal port", port)
+    add_entry(8, "Check interval (seconds)", interval)
+    add_entry(9, "Maximum retry delay (seconds)", max_backoff)
 
-    def save() -> bool:
-        new_username = username.get().strip()
-        new_password = password.get()
-        if not new_username:
-            messagebox.showerror("Missing username", "Enter your portal username or roll number.")
-            return False
-        if not new_password and new_username != config.get("username"):
-            messagebox.showerror("Missing password", "Enter the password for this username.")
-            return False
-        try:
-            new_port = int(port.get())
-            new_interval = max(15, int(interval.get()))
-            if not 1 <= new_port <= 65535:
-                raise ValueError("Portal port must be between 1 and 65535.")
-            if new_password:
-                store_credentials(new_username, new_password, str(config.get("username", "")))
-            elif not keyring.get_password(KEYRING_SERVICE, new_username):
-                raise ValueError("Enter a password; none is currently saved for this username.")
-            config.update({
-                "username": new_username,
-                "portal_host": host.get().strip(),
-                "portal_port": new_port,
-                "check_interval_seconds": new_interval,
+    interface_row = 10
+    ttk.Label(frame, text="Network interface").grid(row=interface_row, column=0, sticky="w", pady=4, padx=(0, 12))
+    interface_box = ttk.Combobox(frame, textvariable=interface, state="readonly", width=31)
+    interface_box.grid(row=interface_row, column=1, sticky="ew", pady=4)
+
+    def refresh_interfaces() -> None:
+        choices = ["auto"] + active_interfaces()
+        if interface.get() not in choices:
+            choices.append(interface.get())
+        interface_box.configure(values=choices)
+
+    ttk.Button(frame, text="Refresh", command=refresh_interfaces).grid(row=interface_row, column=2, padx=(6, 0))
+    refresh_interfaces()
+    ttk.Checkbutton(frame, text="Allow the portal's self-signed HTTPS certificate", variable=insecure).grid(
+        row=interface_row + 1, column=0, columnspan=3, sticky="w", pady=(8, 4)
+    )
+    ttk.Separator(frame).grid(row=interface_row + 2, column=0, columnspan=3, sticky="ew", pady=(12, 10))
+    ttk.Label(frame, textvariable=status, wraplength=520).grid(
+        row=interface_row + 3, column=0, columnspan=3, sticky="w", pady=(0, 4)
+    )
+    ttk.Label(frame, textvariable=startup_status).grid(
+        row=interface_row + 4, column=0, columnspan=3, sticky="w", pady=(0, 8)
+    )
+
+    def candidate_config() -> dict[str, Any]:
+        return validate_config(
+            {
+                **config,
+                "username": username.get(),
+                "portal_scheme": scheme.get(),
+                "portal_host": host.get(),
+                "portal_port": port.get(),
+                "check_interval_seconds": interval.get(),
+                "login_backoff_max_seconds": max_backoff.get(),
                 "network_interface": interface.get(),
                 "allow_self_signed_portal": insecure.get(),
-            })
-            if not config["portal_host"]:
-                raise ValueError("Portal host cannot be empty.")
-            save_config(config)
+            },
+            require_username=True,
+        )
+
+    def save() -> bool:
+        new_password = password.get()
+        try:
+            normalized = candidate_config()
+            new_username = str(normalized["username"])
+            if not new_password:
+                get_password(new_username)
+            if new_password:
+                store_credentials(new_username, new_password, str(config.get("username", "")))
+            save_config(normalized)
+            config.clear()
+            config.update(normalized)
             password.set("")
-            status.set(f"Settings saved to {CONFIG_PATH}. The password is in the OS vault.")
+            request_external_check()
+            status.set("Settings saved securely. The background agent will reload them now.")
             return True
-        except (ValueError, RuntimeError, KeyringError) as exc:
+        except (OSError, ValueError, RuntimeError, KeyringError) as exc:
             messagebox.showerror("Could not save", str(exc))
             return False
 
@@ -632,11 +1198,23 @@ def show_setup_ui() -> int:
             return
         try:
             message = install_startup()
+            startup_status.set("Startup: installed and running")
             status.set(message)
             messagebox.showinfo("Service installed", message)
         except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
             detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
             messagebox.showerror("Installation failed", detail)
+
+    def uninstall() -> None:
+        if not messagebox.askyesno("Remove startup service", "Stop WiFi Agent and remove it from startup? Saved settings and credentials will be kept."):
+            return
+        try:
+            message = uninstall_startup()
+            startup_status.set("Startup: not installed")
+            status.set(message)
+            messagebox.showinfo("Service removed", message)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+            messagebox.showerror("Removal failed", str(exc))
 
     def test_now() -> None:
         if not save():
@@ -645,8 +1223,9 @@ def show_setup_ui() -> int:
 
         def worker() -> None:
             try:
-                wired = wired_interfaces(str(config["network_interface"]))
-                open_ = portal_port_open(str(config["portal_host"]), int(config["portal_port"])) if wired else False
+                normalized = candidate_config()
+                wired = wired_interfaces(str(normalized["network_interface"]))
+                open_ = portal_port_open(str(normalized["portal_host"]), int(normalized["portal_port"])) if wired else False
                 online = internet_available() if wired else False
                 summary = (
                     f"Ethernet: {'connected (' + ', '.join(wired) + ')' if wired else 'not connected'} | "
@@ -660,13 +1239,97 @@ def show_setup_ui() -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     buttons = ttk.Frame(frame)
-    buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(8, 0))
-    ttk.Button(buttons, text="Test now", command=test_now).pack(side="left", padx=4)
+    buttons.grid(row=interface_row + 5, column=0, columnspan=3, sticky="e", pady=(8, 0))
+    ttk.Button(buttons, text="Open logs", command=open_log_location).pack(side="left", padx=4)
+    ttk.Button(buttons, text="Test connection", command=test_now).pack(side="left", padx=4)
     ttk.Button(buttons, text="Save", command=save).pack(side="left", padx=4)
-    ttk.Button(buttons, text="Save & install service", command=install).pack(side="left", padx=4)
+    ttk.Button(buttons, text="Remove startup", command=uninstall).pack(side="left", padx=4)
+    ttk.Button(buttons, text="Save & install", command=install).pack(side="left", padx=4)
+
+    def refresh_status() -> None:
+        snapshot = read_status()
+        if snapshot:
+            checked = snapshot.get("last_check_at") or "not checked yet"
+            process_id = int(snapshot.get("process_id") or 0)
+            running = bool(psutil is not None and process_id and psutil.pid_exists(process_id))
+            prefix = "Agent running" if running else "Agent not running / status stale"
+            status.set(f"{prefix}: {snapshot.get('message', 'Unknown')} · Last check: {checked}")
+        root.after(2000, refresh_status)
+
+    startup_status.set(f"Startup: {'installed' if startup_is_installed() else 'not installed'}")
+    refresh_status()
+    if configuration_warning:
+        root.after(100, lambda: messagebox.showwarning("Configuration needs repair", configuration_warning))
 
     root.mainloop()
     return 0
+
+
+def print_status(*, json_output: bool = False, log_lines: int = 10) -> int:
+    snapshot = read_status()
+    process_id = int((snapshot or {}).get("process_id") or 0)
+    running = bool(psutil is not None and process_id and psutil.pid_exists(process_id))
+    if json_output:
+        payload = snapshot or {"phase": "unknown", "message": "No status has been recorded"}
+        payload = {**payload, "process_running": running, "startup_installed": startup_is_installed()}
+        print(json.dumps(payload, indent=2))
+    elif snapshot:
+        print(f"Running:  {'yes' if running else 'no (status may be stale)'}")
+        print(f"Startup:  {'installed' if startup_is_installed() else 'not installed'}")
+        print(f"State:    {snapshot.get('phase', 'unknown')}")
+        print(f"Message:  {snapshot.get('message', 'Unknown')}")
+        print(f"Checked:  {snapshot.get('last_check_at') or 'never'}")
+        print(f"Ethernet: {'connected' if snapshot.get('ethernet_connected') else 'disconnected'}")
+        port = snapshot.get("portal_port_open")
+        print(f"Portal:   {'open' if port is True else 'unreachable' if port is False else 'not checked'}")
+        online = snapshot.get("internet_available")
+        print(f"Internet: {'available' if online is True else 'unavailable' if online is False else 'not checked'}")
+    else:
+        print("No agent status has been recorded yet.")
+
+    if not json_output and log_lines > 0 and LOG_PATH.exists():
+        print("\nRecent log entries:")
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        print("\n".join(lines[-log_lines:]))
+    return 0 if snapshot else 1
+
+
+def run_doctor() -> int:
+    report: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "configuration_path": str(CONFIG_PATH),
+        "log_path": str(LOG_PATH),
+        "dependencies": {"keyring": keyring is not None, "psutil": psutil is not None},
+        "startup_installed": startup_is_installed(),
+    }
+    healthy = bool(keyring is not None and psutil is not None)
+    try:
+        config = validate_config(load_config(), require_username=True)
+        report["configuration"] = "valid"
+        report["portal"] = f"{config['portal_scheme']}://{_portal_authority(str(config['portal_host']), int(config['portal_port']))}"
+        report["selected_interface"] = config["network_interface"]
+        if keyring is not None:
+            ready, backend = credential_backend_ready()
+            report["credential_vault"] = backend if ready else f"unavailable: {backend}"
+            healthy = healthy and ready
+            if ready:
+                report["credential_saved"] = bool(keyring.get_password(KEYRING_SERVICE, str(config["username"])))
+                healthy = healthy and report["credential_saved"]
+        else:
+            healthy = False
+    except (OSError, RuntimeError, ValueError, KeyringError) as exc:
+        report["configuration"] = f"invalid: {exc}"
+        healthy = False
+    try:
+        report["active_interfaces"] = active_interfaces() if psutil is not None else []
+    except Exception as exc:
+        report["active_interfaces_error"] = str(exc)
+        healthy = False
+    report["last_status"] = read_status()
+    report["healthy"] = healthy
+    print(json.dumps(report, indent=2))
+    return 0 if healthy else 1
 
 
 def main() -> int:
@@ -675,9 +1338,15 @@ def main() -> int:
     subparsers.add_parser("setup", help="open the credential/settings window")
     run_parser = subparsers.add_parser("run", help="run the background monitor")
     run_parser.add_argument("--once", action="store_true", help="perform one status/login cycle")
+    subparsers.add_parser("tray", help="run the Windows notification-area manager")
+    subparsers.add_parser("check", help="ask a running agent to check immediately")
     subparsers.add_parser("install", help="install and start the per-user startup service")
     subparsers.add_parser("uninstall", help="remove the startup service (keep settings)")
-    subparsers.add_parser("status", help="print the most recent service log")
+    status_parser = subparsers.add_parser("status", help="show current state and recent logs")
+    status_parser.add_argument("--json", action="store_true", help="print machine-readable status")
+    status_parser.add_argument("--logs", type=int, default=10, help="number of recent log lines")
+    subparsers.add_parser("doctor", help="validate configuration, vault, startup, and interfaces")
+    subparsers.add_parser("open-logs", help="open the agent log location")
     args = parser.parse_args()
 
     try:
@@ -685,6 +1354,12 @@ def main() -> int:
             return show_setup_ui()
         if args.command == "run":
             return run_agent(args.once)
+        if args.command == "tray":
+            return run_tray()
+        if args.command == "check":
+            request_external_check()
+            print("Immediate check requested. Use 'status' to view the result.")
+            return 0
         if args.command == "install":
             print(install_startup())
             return 0
@@ -692,12 +1367,13 @@ def main() -> int:
             print(uninstall_startup())
             return 0
         if args.command == "status":
-            if LOG_PATH.exists():
-                print("".join(LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines(True)[-30:]), end="")
-                return 0
-            print(f"No log exists yet at {LOG_PATH}")
-            return 1
-    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+            return print_status(json_output=args.json, log_lines=max(0, args.logs))
+        if args.command == "doctor":
+            return run_doctor()
+        if args.command == "open-logs":
+            open_log_location()
+            return 0
+    except (OSError, RuntimeError, ValueError, KeyringError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
         print(f"Error: {detail}", file=sys.stderr)
         return 2

@@ -1,2 +1,4 @@
 keyring>=25.0,<26
 psutil>=5.9,<8
+pystray>=0.19.5,<1; platform_system == "Windows"
+Pillow>=10,<13; platform_system == "Windows"
