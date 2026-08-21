@@ -74,6 +74,7 @@ LOG_PATH = app_dir() / "agent.log"
 STATUS_PATH = app_dir() / "status.json"
 LOCK_PATH = app_dir() / "agent.lock"
 WAKE_PATH = app_dir() / "check.request"
+UI_STATE_PATH = app_dir() / "ui-state.json"
 WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -202,6 +203,23 @@ def snapshot_process_running(snapshot: dict[str, Any] | None) -> bool:
         return bool(psutil is not None and process_id > 0 and psutil.pid_exists(process_id))
     except (OSError, TypeError, ValueError):
         return False
+
+
+def load_ui_state() -> dict[str, Any]:
+    try:
+        value = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_ui_state(state: dict[str, Any]) -> None:
+    app_dir().mkdir(parents=True, exist_ok=True)
+    temporary = UI_STATE_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    if os.name != "nt":
+        temporary.chmod(0o600)
+    temporary.replace(UI_STATE_PATH)
 
 
 def request_external_check() -> None:
@@ -819,14 +837,17 @@ def open_log_location() -> None:
         subprocess.Popen(["xdg-open", str(target)], start_new_session=True)
 
 
-def spawn_setup_window() -> None:
+def spawn_setup_window(pane: str | None = None) -> None:
     executable = Path(sys.executable)
     if sys.platform == "win32":
         pythonw = executable.with_name("pythonw.exe")
         if pythonw.exists():
             executable = pythonw
+    command = [str(executable), str(Path(__file__).resolve()), "setup"]
+    if pane:
+        command.extend(["--pane", pane])
     subprocess.Popen(
-        [str(executable), str(Path(__file__).resolve()), "setup"],
+        command,
         cwd=str(Path(__file__).resolve().parent),
         start_new_session=True,
     )
@@ -837,21 +858,28 @@ def _tray_image():
 
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((4, 4, 60, 60), radius=15, fill=(22, 101, 216, 255))
-    draw.arc((14, 16, 50, 50), 215, 325, fill="white", width=5)
-    draw.arc((21, 25, 43, 47), 215, 325, fill="white", width=5)
-    draw.ellipse((29, 42, 35, 48), fill="white")
+    if sys.platform == "darwin":
+        # Monochrome template-style artwork follows the menu bar appearance.
+        draw.arc((8, 5, 56, 53), 215, 325, fill="black", width=7)
+        draw.arc((17, 17, 47, 47), 215, 325, fill="black", width=7)
+        draw.ellipse((28, 40, 36, 48), fill="black")
+    else:
+        draw.rounded_rectangle((4, 4, 60, 60), radius=15, fill=(22, 101, 216, 255))
+        draw.arc((14, 16, 50, 50), 215, 325, fill="white", width=5)
+        draw.arc((21, 25, 43, 47), 215, 325, fill="white", width=5)
+        draw.ellipse((29, 42, 35, 48), fill="white")
     return image
 
 
 def run_tray() -> int:
-    if sys.platform != "win32":
-        raise RuntimeError("The tray interface is currently supported on Windows only.")
+    if sys.platform not in {"win32", "darwin"}:
+        raise RuntimeError("The menu-bar/tray interface is supported on macOS and Windows.")
     ensure_dependencies()
     try:
         import pystray
     except ImportError as exc:
-        raise RuntimeError("Tray dependencies are missing. Run install.cmd again.") from exc
+        installer = "install.cmd" if sys.platform == "win32" else "./install.sh"
+        raise RuntimeError(f"Menu-bar dependencies are missing. Run {installer} again.") from exc
 
     logger = build_logger(console=False)
     monitor_holder: dict[str, AgentMonitor] = {}
@@ -867,7 +895,11 @@ def run_tray() -> int:
             icon.update_menu()
         except Exception:
             pass
-        if snapshot.phase in {"needs-setup", "error"} and snapshot.phase != last_phase["value"]:
+        if (
+            snapshot.phase in {"needs-setup", "error"}
+            and snapshot.phase != last_phase["value"]
+            and getattr(icon, "HAS_NOTIFICATION", True)
+        ):
             try:
                 icon.notify(snapshot.message, "WiFi Agent needs attention")
             except Exception:
@@ -884,11 +916,21 @@ def run_tray() -> int:
         try:
             spawn_setup_window()
         except OSError as exc:
-            icon.notify(str(exc), "Could not open settings")
+            if getattr(icon, "HAS_NOTIFICATION", True):
+                icon.notify(str(exc), "Could not open settings")
+
+    def open_diagnostics(icon, item) -> None:
+        try:
+            spawn_setup_window("diagnostics")
+        except OSError as exc:
+            if getattr(icon, "HAS_NOTIFICATION", True):
+                icon.notify(str(exc), "Could not open diagnostics")
 
     def check_now(icon, item) -> None:
         monitor.request_check()
         try:
+            if not getattr(icon, "HAS_NOTIFICATION", True):
+                return
             icon.notify("A connectivity and portal check has been requested.", "WiFi Agent")
         except Exception:
             pass
@@ -906,21 +948,37 @@ def run_tray() -> int:
         try:
             open_log_location()
         except OSError as exc:
-            icon.notify(str(exc), "Could not open logs")
+            if getattr(icon, "HAS_NOTIFICATION", True):
+                icon.notify(str(exc), "Could not open logs")
 
     def quit_agent(icon, item) -> None:
         monitor.stop()
         icon.stop()
 
+    is_macos = sys.platform == "darwin"
+    pause_item = (
+        pystray.MenuItem(
+            "Pause Monitoring",
+            toggle_pause,
+            checked=lambda item: monitor.pause_event.is_set(),
+        )
+        if is_macos
+        else pystray.MenuItem(pause_label, toggle_pause)
+    )
     menu = pystray.Menu(
-        pystray.MenuItem("Open WiFi Agent", open_settings, default=True),
+        pystray.MenuItem(
+            "Open WiFi Agent Settings…" if is_macos else "Open WiFi Agent",
+            open_settings,
+            default=not is_macos,
+        ),
         pystray.MenuItem(status_label, lambda icon, item: None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Check and log in now", check_now),
-        pystray.MenuItem(pause_label, toggle_pause),
-        pystray.MenuItem("Open logs", open_logs),
+        pystray.MenuItem("Check Now" if is_macos else "Check and log in now", check_now),
+        pause_item,
+        pystray.MenuItem("View Diagnostics…", open_diagnostics),
+        pystray.MenuItem("Open Logs…" if is_macos else "Open logs", open_logs),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit until next login", quit_agent),
+        pystray.MenuItem("Quit WiFi Agent" if is_macos else "Exit until next login", quit_agent),
     )
     icon = pystray.Icon(APP_NAME, _tray_image(), "WiFi Agent — starting", menu)
     icon_holder["icon"] = icon
@@ -942,7 +1000,7 @@ def _service_command() -> list[str]:
         pythonw = executable.with_name("pythonw.exe")
         if pythonw.exists():
             executable = pythonw
-    mode = "tray" if sys.platform == "win32" else "run"
+    mode = "tray" if sys.platform in {"win32", "darwin"} else "run"
     return [str(executable), str(Path(__file__).resolve()), mode]
 
 
@@ -1009,7 +1067,7 @@ def install_startup() -> str:
             "Label": "com.local.wifi-agent",
             "ProgramArguments": command,
             "RunAtLoad": True,
-            "KeepAlive": True,
+            "KeepAlive": {"SuccessfulExit": False},
             "StandardOutPath": str(LOG_PATH),
             "StandardErrorPath": str(LOG_PATH),
         }
@@ -1083,7 +1141,7 @@ def uninstall_startup() -> str:
     return "Linux systemd user service removed. Saved settings were kept."
 
 
-def show_setup_ui() -> int:
+def show_setup_ui(initial_pane: str | None = None) -> int:
     ensure_dependencies()
     try:
         import tkinter as tk
@@ -1108,11 +1166,36 @@ def show_setup_ui() -> int:
         configuration_warning = f"The saved configuration could not be loaded and must be repaired: {exc}"
 
     root = tk.Tk()
-    root.title("WiFi Agent")
-    root.geometry("780x700")
-    root.minsize(720, 620)
+    is_macos = sys.platform == "darwin"
+    root.title("WiFi Agent Settings" if is_macos else "WiFi Agent")
+    root.geometry("730x650" if is_macos else "780x700")
+    if is_macos:
+        # A settings window is pane-sized rather than a general resizable app
+        # window, matching the platform's Settings convention.
+        root.resizable(False, False)
+    else:
+        root.minsize(720, 620)
+
+    def system_color(name: str, fallback: str) -> str:
+        if not is_macos:
+            return fallback
+        try:
+            root.winfo_rgb(name)
+            return name
+        except tk.TclError:
+            return fallback
 
     colors = {
+        "background": system_color("systemWindowBackgroundColor", "#ececec"),
+        "surface": system_color("systemControlBackgroundColor", "#ffffff"),
+        "primary": system_color("systemControlAccentColor", "#0a84ff"),
+        "text": system_color("systemTextColor", "#1d1d1f"),
+        "muted": system_color("systemSecondaryLabelColor", "#6e6e73"),
+        "success": system_color("systemGreenColor", "#30d158"),
+        "warning": system_color("systemOrangeColor", "#ff9f0a"),
+        "danger": system_color("systemRedColor", "#ff453a"),
+        "idle": system_color("systemGrayColor", "#8e8e93"),
+    } if is_macos else {
         "background": "#f4f7fb",
         "surface": "#ffffff",
         "primary": "#1769d8",
@@ -1129,33 +1212,34 @@ def show_setup_ui() -> int:
     preferred_theme = "vista" if sys.platform == "win32" else "aqua" if sys.platform == "darwin" else "clam"
     if preferred_theme in available_themes:
         style.theme_use(preferred_theme)
-    default_font = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+    default_font = "Segoe UI" if sys.platform == "win32" else "Helvetica Neue" if is_macos else "Helvetica"
     style.configure("App.TFrame", background=colors["background"])
     style.configure("Surface.TFrame", background=colors["surface"])
-    style.configure("Header.TLabel", background=colors["background"], foreground=colors["text"], font=(default_font, 22, "bold"))
+    style.configure("Header.TLabel", background=colors["background"], foreground=colors["text"], font=(default_font, 18 if is_macos else 22, "bold"))
     style.configure("Subtitle.TLabel", background=colors["background"], foreground=colors["muted"], font=(default_font, 10))
     style.configure("CardTitle.TLabel", background=colors["surface"], foreground=colors["muted"], font=(default_font, 9, "bold"))
     style.configure("CardValue.TLabel", background=colors["surface"], foreground=colors["text"], font=(default_font, 13, "bold"))
     style.configure("StatusTitle.TLabel", background=colors["surface"], foreground=colors["text"], font=(default_font, 15, "bold"))
     style.configure("StatusText.TLabel", background=colors["surface"], foreground=colors["muted"], font=(default_font, 10))
     style.configure("Hint.TLabel", foreground=colors["muted"], font=(default_font, 9))
-    style.configure("Accent.TButton", font=(default_font, 9, "bold"), padding=(13, 7))
-    style.configure("Action.TButton", padding=(11, 7))
+    style.configure("Accent.TButton", font=(default_font, 9, "bold"), padding=(12, 5) if is_macos else (13, 7))
+    style.configure("Action.TButton", padding=(10, 5) if is_macos else (11, 7))
     style.configure("TNotebook", background=colors["background"], borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(18, 9), font=(default_font, 9, "bold"))
+    style.configure("TNotebook.Tab", padding=(20, 7) if is_macos else (18, 9), font=(default_font, 9, "bold"))
 
-    icon = tk.PhotoImage(width=32, height=32)
-    icon.put(colors["primary"], to=(3, 3, 29, 29))
-    icon.put("#ffffff", to=(9, 10, 23, 13))
-    icon.put("#ffffff", to=(12, 16, 20, 19))
-    icon.put("#ffffff", to=(15, 22, 18, 25))
-    root.iconphoto(True, icon)
+    if not is_macos:
+        icon = tk.PhotoImage(width=32, height=32)
+        icon.put(colors["primary"], to=(3, 3, 29, 29))
+        icon.put("#ffffff", to=(9, 10, 23, 13))
+        icon.put("#ffffff", to=(12, 16, 20, 19))
+        icon.put("#ffffff", to=(15, 22, 18, 25))
+        root.iconphoto(True, icon)
 
-    main = ttk.Frame(root, style="App.TFrame", padding=(24, 18, 24, 20))
+    main = ttk.Frame(root, style="App.TFrame", padding=(22, 14, 22, 18) if is_macos else (24, 18, 24, 20))
     main.pack(fill="both", expand=True)
     header = ttk.Frame(main, style="App.TFrame")
     header.pack(fill="x", pady=(0, 14))
-    ttk.Label(header, text="WiFi Agent", style="Header.TLabel").pack(anchor="w")
+    ttk.Label(header, text="WiFi Agent Settings" if is_macos else "WiFi Agent", style="Header.TLabel").pack(anchor="w")
     ttk.Label(
         header,
         text="Sophos/Cyberoam connectivity monitoring, secure login, and service management",
@@ -1167,8 +1251,8 @@ def show_setup_ui() -> int:
     overview_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
     settings_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
     diagnostics_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
-    notebook.add(overview_tab, text="Overview")
-    notebook.add(settings_tab, text="Settings")
+    notebook.add(overview_tab, text="General" if is_macos else "Overview")
+    notebook.add(settings_tab, text="Connection" if is_macos else "Settings")
     notebook.add(diagnostics_tab, text="Diagnostics")
 
     username = tk.StringVar(value=str(config["username"]))
@@ -1193,6 +1277,11 @@ def show_setup_ui() -> int:
     feedback_override_until = {"value": 0.0}
     startup_installed = {"value": startup_is_installed()}
     agent_running = {"value": False}
+
+    def startup_description(installed: bool) -> str:
+        if is_macos:
+            return "Available from the menu bar after login" if installed else "Not installed as a Login Item"
+        return "Starts automatically at user login" if installed else "Not installed at startup"
 
     # Overview status card.
     status_card = ttk.Frame(overview_tab, style="Surface.TFrame", padding=18)
@@ -1327,10 +1416,11 @@ def show_setup_ui() -> int:
         height=22,
         wrap="word",
         font=("Consolas" if sys.platform == "win32" else "TkFixedFont", 9),
-        background="#101722",
-        foreground="#dbe7f7",
-        insertbackground="#ffffff",
-        relief="flat",
+        background=colors["surface"] if is_macos else "#101722",
+        foreground=colors["text"] if is_macos else "#dbe7f7",
+        insertbackground=colors["text"] if is_macos else "#ffffff",
+        selectbackground=colors["primary"],
+        relief="sunken" if is_macos else "flat",
         padx=12,
         pady=12,
     )
@@ -1407,7 +1497,7 @@ def show_setup_ui() -> int:
 
         def installed(message: str) -> None:
             startup_installed["value"] = True
-            startup_value.set("Starts automatically at user login")
+            startup_value.set(startup_description(True))
             set_feedback(message, seconds=8)
             messagebox.showinfo("Service installed", message)
 
@@ -1418,7 +1508,7 @@ def show_setup_ui() -> int:
             return
         def uninstalled(message: str) -> None:
             startup_installed["value"] = False
-            startup_value.set("Not installed at startup")
+            startup_value.set(startup_description(False))
             set_feedback(message, seconds=8)
             messagebox.showinfo("Service removed", message)
 
@@ -1498,6 +1588,19 @@ def show_setup_ui() -> int:
         set_feedback("Diagnostics copied to the clipboard.")
 
     def on_tab_changed(event=None) -> None:
+        pane_by_widget = {
+            str(overview_tab): "general" if is_macos else "overview",
+            str(settings_tab): "connection" if is_macos else "settings",
+            str(diagnostics_tab): "diagnostics",
+        }
+        selected_pane = pane_by_widget.get(notebook.select(), "general" if is_macos else "overview")
+        try:
+            save_ui_state({"last_pane": selected_pane})
+        except OSError:
+            pass
+        if is_macos:
+            pane_title = {"general": "General", "connection": "Connection", "diagnostics": "Diagnostics"}[selected_pane]
+            root.title(f"WiFi Agent Settings — {pane_title}")
         if notebook.select() == str(diagnostics_tab):
             refresh_diagnostics()
 
@@ -1507,26 +1610,80 @@ def show_setup_ui() -> int:
         notebook.select(settings_tab)
 
     # Wire actions after functions exist.
-    install_button = ttk.Button(service_actions, text="Install / repair", command=install, style="Action.TButton")
+    install_button = ttk.Button(
+        service_actions,
+        text="Install at Login" if is_macos else "Install / repair",
+        command=install,
+        style="Action.TButton",
+    )
     install_button.pack(side="left", padx=4)
-    remove_button = ttk.Button(service_actions, text="Remove", command=uninstall, style="Action.TButton")
+    remove_button = ttk.Button(
+        service_actions,
+        text="Remove from Login" if is_macos else "Remove",
+        command=uninstall,
+        style="Action.TButton",
+    )
     remove_button.pack(side="left", padx=4)
-    check_button = ttk.Button(quick_actions, text="Check now", command=check_now, style="Accent.TButton")
+    check_button = ttk.Button(quick_actions, text="Check Now" if is_macos else "Check now", command=check_now, style="Accent.TButton")
     check_button.pack(side="left", padx=(0, 8))
-    ttk.Button(quick_actions, text="Open settings", command=go_to_settings, style="Action.TButton").pack(side="left", padx=4)
-    ttk.Button(quick_actions, text="Open logs", command=safe_open_logs, style="Action.TButton").pack(side="left", padx=4)
+    ttk.Button(
+        quick_actions,
+        text="Connection Settings…" if is_macos else "Open settings",
+        command=go_to_settings,
+        style="Action.TButton",
+    ).pack(side="left", padx=4)
+    ttk.Button(
+        quick_actions,
+        text="Open Logs…" if is_macos else "Open logs",
+        command=safe_open_logs,
+        style="Action.TButton",
+    ).pack(side="left", padx=4)
 
-    test_button = ttk.Button(settings_actions, text="Test connection", command=test_now, style="Action.TButton")
+    test_button = ttk.Button(settings_actions, text="Test Connection" if is_macos else "Test connection", command=test_now, style="Action.TButton")
     test_button.pack(side="left")
-    save_install_button = ttk.Button(settings_actions, text="Save & install", command=install, style="Accent.TButton")
+    save_install_button = ttk.Button(
+        settings_actions,
+        text="Save & Install at Login" if is_macos else "Save & install",
+        command=install,
+        style="Accent.TButton",
+    )
     save_install_button.pack(side="right")
-    save_button = ttk.Button(settings_actions, text="Save settings", command=save, style="Action.TButton")
+    save_button = ttk.Button(settings_actions, text="Save" if is_macos else "Save settings", command=save, style="Action.TButton")
     save_button.pack(side="right", padx=(0, 8))
 
     ttk.Button(diagnostic_actions, text="Refresh", command=refresh_diagnostics, style="Action.TButton").pack(side="left")
     ttk.Button(diagnostic_actions, text="Copy", command=copy_diagnostics, style="Action.TButton").pack(side="left", padx=8)
-    ttk.Button(diagnostic_actions, text="Open log file", command=safe_open_logs, style="Action.TButton").pack(side="right")
+    ttk.Button(
+        diagnostic_actions,
+        text="Open Log…" if is_macos else "Open log file",
+        command=safe_open_logs,
+        style="Action.TButton",
+    ).pack(side="right")
     busy_buttons.extend([install_button, remove_button, check_button, test_button, save_button, save_install_button])
+
+    remembered_pane = str(load_ui_state().get("last_pane", ""))
+    requested_pane = (initial_pane or remembered_pane).casefold()
+    if requested_pane in {"settings", "connection"}:
+        notebook.select(settings_tab)
+    elif requested_pane == "diagnostics":
+        notebook.select(diagnostics_tab)
+    else:
+        notebook.select(overview_tab)
+    on_tab_changed()
+
+    if is_macos:
+        root.bind_all("<Command-s>", lambda event: (save(), "break")[1])
+        root.bind_all("<Command-w>", lambda event: (root.destroy(), "break")[1])
+        root.bind_all("<Command-comma>", lambda event: (go_to_settings(), "break")[1])
+
+        def show_preferences() -> None:
+            root.deiconify()
+            root.lift()
+            go_to_settings()
+
+        root.createcommand("tk::mac::ShowPreferences", show_preferences)
+    else:
+        root.bind_all("<Control-s>", lambda event: (save(), "break")[1])
 
     def refresh_status() -> None:
         snapshot = read_status()
@@ -1542,7 +1699,7 @@ def show_setup_ui() -> int:
             status_title.set(str(snapshot.get("message", "Unknown")))
             status_detail.set(f"Phase: {phase} · Process ID: {process_id or 'unknown'}")
             runtime_value.set("Agent running" if running else "Agent not running")
-            startup_value.set("Starts automatically at user login" if startup_installed["value"] else "Not installed at startup")
+            startup_value.set(startup_description(startup_installed["value"]))
             last_check_value.set(f"Last checked: {checked}")
             interfaces = snapshot.get("interfaces") or []
             ethernet_value.set("Connected" if snapshot.get("ethernet_connected") else "Disconnected")
@@ -1566,7 +1723,7 @@ def show_setup_ui() -> int:
             status_title.set("No status recorded")
             status_detail.set("Install or start WiFi Agent to begin monitoring.")
             runtime_value.set("Agent not running")
-            startup_value.set("Starts automatically at user login" if startup_installed["value"] else "Not installed at startup")
+            startup_value.set(startup_description(startup_installed["value"]))
         root.after(2000, refresh_status)
 
     refresh_status()
@@ -1647,10 +1804,15 @@ def run_doctor() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("setup", help="open the credential/settings window")
+    setup_parser = subparsers.add_parser("setup", help="open the credential/settings window")
+    setup_parser.add_argument(
+        "--pane",
+        choices=("overview", "general", "settings", "connection", "diagnostics"),
+        help="open a specific settings pane",
+    )
     run_parser = subparsers.add_parser("run", help="run the background monitor")
     run_parser.add_argument("--once", action="store_true", help="perform one status/login cycle")
-    subparsers.add_parser("tray", help="run the Windows notification-area manager")
+    subparsers.add_parser("tray", help="run the macOS menu-bar or Windows notification-area manager")
     subparsers.add_parser("check", help="ask a running agent to check immediately")
     subparsers.add_parser("install", help="install and start the per-user startup service")
     subparsers.add_parser("uninstall", help="remove the startup service (keep settings)")
@@ -1663,7 +1825,7 @@ def main() -> int:
 
     try:
         if args.command in (None, "setup"):
-            return show_setup_ui()
+            return show_setup_ui(getattr(args, "pane", None))
         if args.command == "run":
             return run_agent(args.once)
         if args.command == "tray":
