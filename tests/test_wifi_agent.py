@@ -153,6 +153,25 @@ class MonitorTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
+    def test_frozen_application_commands_do_not_reference_source_script(self) -> None:
+        executable = Path("/Applications/WiFi Agent.app/Contents/MacOS/WiFi Agent")
+        with (
+            patch.object(app.sys, "frozen", True, create=True),
+            patch.object(app.sys, "executable", str(executable)),
+            patch.object(app.sys, "platform", "darwin"),
+        ):
+            self.assertEqual(app._service_command(), [str(executable), "tray"])
+            self.assertEqual(app._application_working_directory(), executable.parent)
+
+    def test_macos_install_at_login_rejects_app_running_from_disk_image(self) -> None:
+        with (
+            patch.object(app.sys, "frozen", True, create=True),
+            patch.object(app.sys, "executable", "/Volumes/WiFi Agent/WiFi Agent.app/Contents/MacOS/WiFi Agent"),
+            patch.object(app.sys, "platform", "darwin"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Applications folder"):
+                app.install_startup()
+
     @unittest.skipIf(sys.platform == "win32", "Unix lock behavior")
     def test_single_instance_lock_rejects_duplicate_monitor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
