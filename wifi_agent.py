@@ -43,8 +43,16 @@ try:
 except ImportError:
     psutil = None
 
-
 APP_NAME = "WiFiAgent"
+APP_DISPLAY_NAME = "WiFi Agent"
+APP_VERSION = "1.0.0"
+if getattr(sys, "frozen", False):
+    try:
+        from wifi_agent_build import BUILD_VERSION
+
+        APP_VERSION = BUILD_VERSION
+    except ImportError:
+        pass
 KEYRING_SERVICE = "WiFi Agent"
 DEFAULT_CONFIG: dict[str, Any] = {
     "username": "",
@@ -837,18 +845,32 @@ def open_log_location() -> None:
         subprocess.Popen(["xdg-open", str(target)], start_new_session=True)
 
 
-def spawn_setup_window(pane: str | None = None) -> None:
+def _application_command(*arguments: str) -> list[str]:
+    """Return a command that works from source and from a frozen app bundle."""
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve()), *arguments]
+
     executable = Path(sys.executable)
     if sys.platform == "win32":
         pythonw = executable.with_name("pythonw.exe")
         if pythonw.exists():
             executable = pythonw
-    command = [str(executable), str(Path(__file__).resolve()), "setup"]
+    return [str(executable), str(Path(__file__).resolve()), *arguments]
+
+
+def _application_working_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def spawn_setup_window(pane: str | None = None) -> None:
+    command = _application_command("setup")
     if pane:
         command.extend(["--pane", pane])
     subprocess.Popen(
         command,
-        cwd=str(Path(__file__).resolve().parent),
+        cwd=str(_application_working_directory()),
         start_new_session=True,
     )
 
@@ -995,16 +1017,19 @@ def run_tray() -> int:
 
 
 def _service_command() -> list[str]:
-    executable = Path(sys.executable)
-    if sys.platform == "win32":
-        pythonw = executable.with_name("pythonw.exe")
-        if pythonw.exists():
-            executable = pythonw
     mode = "tray" if sys.platform in {"win32", "darwin"} else "run"
-    return [str(executable), str(Path(__file__).resolve()), mode]
+    return _application_command(mode)
 
 
 def install_startup() -> str:
+    if (
+        sys.platform == "darwin"
+        and getattr(sys, "frozen", False)
+        and str(Path(sys.executable).resolve()).startswith("/Volumes/")
+    ):
+        raise RuntimeError(
+            "Move WiFi Agent to the Applications folder before enabling Install at Login."
+        )
     username = str(load_config().get("username", "")).strip()
     if not username:
         raise RuntimeError("Save credentials before installing the startup service.")
@@ -1036,7 +1061,7 @@ def install_startup() -> str:
   <Actions Context="Author"><Exec>
     <Command>{xml_escape(command[0])}</Command>
     <Arguments>{xml_escape(arguments)}</Arguments>
-    <WorkingDirectory>{xml_escape(str(Path(__file__).resolve().parent))}</WorkingDirectory>
+    <WorkingDirectory>{xml_escape(str(_application_working_directory()))}</WorkingDirectory>
   </Exec></Actions>
 </Task>
 '''
@@ -1803,6 +1828,7 @@ def run_doctor() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"{APP_DISPLAY_NAME} {APP_VERSION}")
     subparsers = parser.add_subparsers(dest="command")
     setup_parser = subparsers.add_parser("setup", help="open the credential/settings window")
     setup_parser.add_argument(
@@ -1849,7 +1875,15 @@ def main() -> int:
             return 0
     except (OSError, RuntimeError, ValueError, KeyringError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
-        print(f"Error: {detail}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(f"Error: {detail}", file=sys.stderr)
+        elif getattr(sys, "frozen", False) and sys.platform in {"win32", "darwin"}:
+            try:
+                from tkinter import messagebox
+
+                messagebox.showerror(APP_DISPLAY_NAME, detail)
+            except Exception:
+                pass
         return 2
     return 0
 
