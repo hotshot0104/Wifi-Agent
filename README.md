@@ -12,7 +12,8 @@ automatically restores or keeps alive an authenticated session.
 - Logs in only when Ethernet is connected and internet access is unavailable.
 - Stores passwords in the operating system credential vault—never in project
   files or `config.json`.
-- Provides a compact graphical setup and diagnostics window.
+- Provides a native management dashboard with live health cards, grouped
+  settings, startup controls, and a copyable diagnostics/log viewer.
 - Provides a Windows notification-area icon for day-to-day management.
 - Starts automatically at user login and restarts after failures.
 - Prevents duplicate monitor instances and uses bounded exponential retry
@@ -42,6 +43,11 @@ On macOS or Linux, run:
 Enter the portal credentials and settings, select the correct Ethernet adapter
 if automatic detection is unsuitable, choose **Test connection**, then choose
 **Save & install**.
+
+The dashboard's **Overview** tab shows live Ethernet, portal-port, internet,
+process, and startup health. **Settings** manages credentials and retry policy,
+while **Diagnostics** provides a safe status snapshot and recent logs without
+including the saved password.
 
 On Windows, installation starts a WiFi Agent icon in the notification area of
 the taskbar. Click it to open settings, or right-click it to check and
