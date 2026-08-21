@@ -14,7 +14,8 @@ automatically restores or keeps alive an authenticated session.
   files or `config.json`.
 - Provides a native management dashboard with live health cards, grouped
   settings, startup controls, and a copyable diagnostics/log viewer.
-- Provides a Windows notification-area icon for day-to-day management.
+- Provides a macOS menu-bar item and Windows notification-area icon for
+  day-to-day management.
 - Starts automatically at user login and restarts after failures.
 - Prevents duplicate monitor instances and uses bounded exponential retry
   backoff when a portal or upstream connection is unhealthy.
@@ -41,19 +42,27 @@ On macOS or Linux, run:
 ```
 
 Enter the portal credentials and settings, select the correct Ethernet adapter
-if automatic detection is unsuitable, choose **Test connection**, then choose
-**Save & install**.
+if automatic detection is unsuitable, choose **Test Connection**, then choose
+**Save & Install at Login** on macOS or **Save & install** on Windows and Linux.
 
-The dashboard's **Overview** tab shows live Ethernet, portal-port, internet,
-process, and startup health. **Settings** manages credentials and retry policy,
-while **Diagnostics** provides a safe status snapshot and recent logs without
-including the saved password.
+The dashboard's **Overview** tab (**General** on macOS) shows live Ethernet,
+portal-port, internet, process, and startup health. **Settings** (**Connection**
+on macOS) manages credentials and retry policy, while **Diagnostics** provides
+a safe status snapshot and recent logs without including the saved password.
 
 On Windows, installation starts a WiFi Agent icon in the notification area of
 the taskbar. Click it to open settings, or right-click it to check and
 log in immediately, pause/resume monitoring, open logs, or exit until the next
 Windows login. The command script is only needed for the initial installation
 or troubleshooting.
+
+On macOS, installation creates a menu-bar item with live status, Check Now,
+pause/resume, Settings, Diagnostics, logs, and Quit commands. The macOS settings
+window uses the native Aqua theme, system appearance and accent colors,
+pane-specific titles, fixed settings-window sizing, remembered panes, and the
+standard Command–Comma, Command–S, and Command–W shortcuts. Choosing **Quit
+WiFi Agent** keeps it closed for the rest of the login session; it starts again
+at the next login.
 
 The installer creates an isolated runtime in the user's application-data
 directory. The downloaded project folder can be moved or removed afterward.
