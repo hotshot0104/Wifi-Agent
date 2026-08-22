@@ -1,5 +1,15 @@
 # WiFi Agent
 
+## Download version 1.2.0
+
+Installers are available directly—no ZIP extraction or separate Python runtime
+is required:
+
+- [Windows 64-bit setup](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-Windows-x64-Setup.exe)
+- [Apple silicon Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-macOS-arm64.pkg)
+- [Intel Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-macOS-x86_64.pkg)
+- [All installers and release notes](https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.2.0)
+
 WiFi Agent is a lightweight, cross-platform background service for networks
 using a Sophos or Cyberoam captive portal. It monitors wired connectivity,
 checks whether the portal is reachable, verifies real internet access, and
@@ -155,8 +165,10 @@ Every manual run publishes a prerelease page containing the `.exe`, `.pkg`, and
 `.dmg` files as direct downloads instead of requiring users to extract Actions
 artifact ZIPs. Pushing a version tag such as `v1.0.0` builds the installers and
 attaches them to the corresponding GitHub release automatically.
-Published workflow builds intentionally fail instead of distributing unsigned
-software. Add the following repository secrets before running the workflow:
+When signing secrets are configured, workflow builds are signed and macOS
+installers are notarized. Without them, CI clearly marks the build as unsigned
+but still publishes testable installers. Configure these repository secrets for
+trusted public distribution:
 
 - `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD`
 - `MACOS_CERTIFICATE_BASE64` and `MACOS_CERTIFICATE_PASSWORD`

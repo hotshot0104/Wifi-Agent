@@ -59,15 +59,18 @@ jobs:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)) {
-            throw "Published installers require the Windows signing certificate and password secrets."
+          $CertificateConfigured = -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)
+          $PasswordConfigured = -not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)
+          if ($CertificateConfigured -ne $PasswordConfigured) {
+            throw "Configure both Windows signing secrets or leave both unset."
           }
-          if (-not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) {
+          if ($CertificateConfigured) {
             $CertificatePath = Join-Path $env:RUNNER_TEMP "wifi-agent-signing.pfx"
             [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
             "WINDOWS_SIGNING_CERTIFICATE=$CertificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append
             "WINDOWS_SIGNING_PASSWORD=$env:CERTIFICATE_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            Write-Warning "Windows signing secrets are not configured; publishing an unsigned installer."
           }
       - name: Build Windows installer
         shell: pwsh
@@ -121,12 +124,19 @@ jobs:
           NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
           NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
         run: |
+          CONFIGURED_VALUES=0
           for required in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD APP_SIGNING_IDENTITY INSTALLER_SIGNING_IDENTITY NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
-            if [[ -z "${!required}" ]]; then
-              echo "Published installers require the $required signing secret." >&2
-              exit 1
+            if [[ -n "${!required}" ]]; then
+              CONFIGURED_VALUES=$((CONFIGURED_VALUES + 1))
             fi
           done
+          if [[ "$CONFIGURED_VALUES" -ne 0 && "$CONFIGURED_VALUES" -ne 7 ]]; then
+            echo "Configure all seven Apple signing/notarization secrets or leave all of them unset." >&2
+            exit 1
+          fi
+          if [[ "$CONFIGURED_VALUES" -eq 0 ]]; then
+            echo "::warning::Apple signing secrets are not configured; publishing an ad-hoc signed, unnotarized installer."
+          fi
           if [[ -n "$CERTIFICATE_BASE64" ]]; then
             CERTIFICATE_PATH="$RUNNER_TEMP/wifi-agent-signing.p12"
             KEYCHAIN_PATH="$RUNNER_TEMP/wifi-agent-build.keychain-db"
@@ -164,6 +174,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -176,7 +187,12 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             RELEASE_TAG="$GITHUB_REF_NAME"
             RELEASE_TITLE="WiFi Agent ${GITHUB_REF_NAME#v}"
-            CREATE_ARGUMENTS=(--verify-tag --generate-notes)
+            NOTES_FILE=".github/release-notes/$RELEASE_TAG.md"
+            if [[ -f "$NOTES_FILE" ]]; then
+              CREATE_ARGUMENTS=(--verify-tag --notes-file "$NOTES_FILE")
+            else
+              CREATE_ARGUMENTS=(--verify-tag --generate-notes)
+            fi
           else
             VERSION="$REQUESTED_VERSION"
             RELEASE_TAG="installer-build-${GITHUB_RUN_NUMBER}"
