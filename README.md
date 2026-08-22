@@ -1,201 +1,320 @@
 # WiFi Agent
 
-## Download version 1.3.0
+**Reliable Sophos/Cyberoam captive-portal authentication for wired networks.**
 
-Installers are available directly—no ZIP extraction or separate Python runtime
-is required:
+WiFi Agent monitors Ethernet connectivity, restores authenticated portal
+sessions, and keeps connection status visible from a native desktop interface.
 
-- [Windows 64-bit setup](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-Windows-x64-Setup.exe)
-- [Apple silicon Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-arm64.pkg)
-- [Intel Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-x86_64.pkg)
-- [All installers and release notes](https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.3.0)
+[![Latest release](https://img.shields.io/github/v/release/akshajtiwari/Wifi-Agent?display_name=tag&sort=semver)](https://github.com/akshajtiwari/Wifi-Agent/releases/latest)
+[![Native installer builds](https://github.com/akshajtiwari/Wifi-Agent/actions/workflows/build-installers.yml/badge.svg)](https://github.com/akshajtiwari/Wifi-Agent/actions/workflows/build-installers.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](#source-installation)
+[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-555)](#downloads)
 
-WiFi Agent is a lightweight, cross-platform background service for networks
-using a Sophos or Cyberoam captive portal. It monitors wired connectivity,
-checks whether the portal is reachable, verifies real internet access, and
-automatically restores or keeps alive an authenticated session.
+[Download](#downloads) · [Quick start](#quick-start) · [Usage](#using-wifi-agent) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
-## Features
+## Overview
 
-- Supports Windows, macOS, and Linux.
-- Distinguishes Ethernet, portal-port, and internet status.
-- Logs in only when Ethernet is connected and internet access is unavailable.
-- Stores passwords in the operating system credential vault—never in project
-  files or `config.json`.
-- Provides a native management dashboard with live health cards, grouped
-  settings, startup controls, and a copyable diagnostics/log viewer.
-- Provides a macOS menu-bar item and Windows notification-area icon for
-  day-to-day management.
-- Starts automatically at user login and restarts after failures.
-- Prevents duplicate monitor instances and uses bounded exponential retry
-  backoff when a portal or upstream connection is unhealthy.
-- Checks for updates from inside the app, verifies the selected native installer
-  with its GitHub SHA-256 digest, and installs it without clearing saved setup.
+WiFi Agent is a lightweight background service for networks protected by a
+Sophos or Cyberoam captive portal. It distinguishes the physical Ethernet link,
+portal reachability, authenticated portal session, and public internet access,
+then logs in only when action is required.
 
-Version 1.3.0 and later can install future updates from **Check for updates** in
-the dashboard or notification-area/menu-bar menu. Users upgrading from 1.2.0
-install 1.3.0 once using the links above; later releases can be installed inside
-WiFi Agent.
+### Core capabilities
 
-## Requirements
+| Area | Capability |
+| --- | --- |
+| Connection | Detects active physical Ethernet interfaces and monitors portal reachability |
+| Authentication | Restores sessions automatically and sends portal keep-alive requests |
+| Status | Separately reports Ethernet, portal session, internet access, process, and startup health |
+| Credentials | Stores passwords in the operating-system credential vault, never in `config.json` |
+| Reliability | Prevents duplicate monitors, reloads settings live, and applies bounded retry backoff |
+| Management | Provides a dashboard, diagnostics viewer, logs, and Windows tray/macOS menu-bar controls |
+| Updates | Finds the correct native installer, verifies its SHA-256 digest, and updates in place |
 
-- Native installer: no separate Python installation is required
-- Source/script installation: Python 3.10 or newer
-- An unlocked OS credential vault: Windows Credential Manager, macOS Keychain,
-  or a Linux Secret Service provider
-- On some Linux distributions, the `python3-tk` package
+## Downloads
 
-## Installation
+### WiFi Agent 1.3.0
 
-### Native installers
+Native installers bundle the complete runtime. End users do not need Python or
+the repository source code.
 
-Download the installer matching the computer from the GitHub release:
+| Platform | Architecture | Recommended installer | Alternative |
+| --- | --- | --- | --- |
+| Windows | x86-64 | [Download setup `.exe`](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-Windows-x64-Setup.exe) | — |
+| macOS | Apple silicon | [Download package `.pkg`](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-arm64.pkg) | [Disk image `.dmg`](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-arm64.dmg) |
+| macOS | Intel | [Download package `.pkg`](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-x86_64.pkg) | [Disk image `.dmg`](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-x86_64.dmg) |
+| Linux | Distribution-independent | [Source installation](#source-installation) | — |
 
-- **Windows 64-bit:** run `WiFiAgent-<version>-Windows-x64-Setup.exe`. The
-  per-user installer does not require administrator access and opens the secure
-  settings window when it finishes.
-- **Apple silicon Mac:** open the `arm64` `.pkg` or `.dmg`.
-- **Intel Mac:** open the `x86_64` `.pkg` or `.dmg`.
+[View the v1.3.0 release notes](https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.3.0) or browse the [complete changelog](CHANGELOG.md).
 
-The macOS package installs **WiFi Agent.app** in `/Applications` and opens its
-settings for the signed-in user. The disk image offers the familiar alternative
-of dragging **WiFi Agent.app** into **Applications** and opening it once.
+> [!IMPORTANT]
+> The current public installers are not backed by Windows or Apple Developer ID
+> certificates because signing secrets are not configured for this repository.
+> Windows may show an unknown-publisher warning. macOS may require **Open
+> Anyway** in **System Settings → Privacy & Security**. Native builds still run
+> packaged-runtime checks, and in-app updates are SHA-256 verified before use.
 
-On first opening, WiFi Agent shows only the initial credential and connection
-setup. Enter the portal credentials and settings, select the correct Ethernet
-adapter if automatic detection is unsuitable, choose **Test Connection**, then
-choose **Save & Install at Login** on macOS or **Save & install** on Windows.
-This stores the password in the operating-system credential vault, activates
-the login-time agent, and then reveals the live dashboard.
+## Quick start
 
-### Script installation
+1. Download the installer matching the computer from the table above.
+2. Install WiFi Agent:
+   - On Windows, run the `.exe` setup.
+   - On macOS, run the `.pkg`; or copy **WiFi Agent.app** from the `.dmg` into
+     **Applications** and open it once.
+3. Enter the portal username or roll number and password.
+4. Confirm the portal address and select an Ethernet adapter if automatic
+   detection is unsuitable.
+5. Choose **Test Connection**.
+6. Choose **Save & install** on Windows or **Save & Install at Login** on macOS.
 
-The source-based installers remain available for development and Linux. On
-Windows, double-click `install.cmd` or run:
+The first launch displays only initial setup. After credentials and login-time
+monitoring are configured, WiFi Agent reveals the live dashboard and begins
+monitoring in the background.
 
-```powershell
-.\install.ps1
-```
+## How it works
 
-On macOS or Linux, run:
+Each monitoring cycle follows the same conservative sequence:
+
+1. Detect an active wired interface.
+2. Check whether the configured portal port is reachable.
+3. Query the portal for an existing authenticated session.
+4. Verify public internet access without following captive-portal redirects.
+5. Log in only when Ethernet and the portal are reachable but neither a valid
+   portal session nor internet access is available.
+6. Publish an atomic status snapshot for the dashboard, tray/menu bar, CLI, and
+   diagnostics viewer.
+
+A confirmed portal session remains visibly **Connected** when a public probe is
+blocked or inconclusive. This prevents a working background login from appearing
+to have failed.
+
+## Using WiFi Agent
+
+### Dashboard
+
+| Pane | Purpose |
+| --- | --- |
+| **Overview** / **General** | Live connection, portal, process, and startup health |
+| **Settings** / **Connection** | Credentials, portal address, interface selection, and retry policy |
+| **Diagnostics** | Sanitized status snapshot and recent logs, ready to copy for troubleshooting |
+
+The Windows settings pane scrolls in compact, non-maximized windows so every
+connection-test and save action remains accessible.
+
+### Tray and menu bar
+
+The Windows notification-area icon and macOS menu-bar item provide quick access
+to:
+
+- Current connection status
+- Check and log in now
+- Pause or resume monitoring
+- Check for updates
+- Settings and diagnostics
+- Log files
+- Quit until the next user login
+
+### In-app updates
+
+Version 1.3.0 and later can install future stable releases from **Check for
+updates** in the dashboard or tray/menu-bar menu. Native dashboard launches also
+perform a quiet update check.
+
+The updater:
+
+1. Reads the latest stable GitHub Release.
+2. Selects the Windows x64, Apple silicon, or Intel Mac package.
+3. Requires a trusted GitHub HTTPS URL and a valid published SHA-256 digest.
+4. Downloads into the private application-data directory with a strict size
+   limit.
+5. Verifies the complete file before starting the native installer.
+
+Windows updates run silently and restart the notification-area process. macOS
+uses the standard administrator authorization prompt. Credentials, settings,
+logs, and startup configuration remain in the user profile and survive an app
+replacement.
+
+Users on 1.2.0 install 1.3.0 once with a native installer; subsequent releases
+can be installed from inside WiFi Agent.
+
+## Source installation
+
+Source installation is intended for Linux, development, and troubleshooting.
+
+### Requirements
+
+- Python 3.10 or newer
+- An unlocked credential vault:
+  - Windows Credential Manager
+  - macOS Keychain
+  - Linux Secret Service
+- `python3-tk` on Linux distributions that package Tk separately
+
+### Install
+
+On macOS or Linux:
 
 ```sh
 ./install.sh
 ```
 
-The dashboard's **Overview** tab (**General** on macOS) shows live Ethernet,
-portal-port, internet, process, and startup health. **Settings** (**Connection**
-on macOS) manages credentials and retry policy, while **Diagnostics** provides
-a safe status snapshot and recent logs without including the saved password.
+On Windows, double-click `install.cmd` or run:
 
-On Windows, installation starts a WiFi Agent icon in the notification area of
-the taskbar. Click it to open settings, or right-click it to check and
-log in immediately, pause/resume monitoring, open logs, or exit until the next
-Windows login. The command script is only needed for the initial installation
-or troubleshooting.
-
-On macOS, installation creates a menu-bar item with live status, Check Now,
-pause/resume, Settings, Diagnostics, logs, and Quit commands. The macOS settings
-window uses the native Aqua theme, system appearance and accent colors,
-pane-specific titles, fixed settings-window sizing, remembered panes, and the
-standard Command–Comma, Command–S, and Command–W shortcuts. Choosing **Quit
-WiFi Agent** keeps it closed for the rest of the login session; it starts again
-at the next login.
-
-The script installer creates an isolated runtime in the user's application-data
-directory. Native installers bundle their runtime inside the installed app, so
-neither installation method depends on the downloaded project folder afterward.
-
-## Management
-
-Native-installer users can manage the agent from its menu-bar/taskbar icon and
-settings window. For a source installation, pass a command through the platform
-installer:
-
-```sh
-./install.sh setup       # Change credentials or settings
-./install.sh run         # Run interactively
-./install.sh run --once  # Run one diagnostic/login cycle
-./install.sh check       # Ask the running agent to check immediately
-./install.sh status      # Display live state and recent logs
-./install.sh doctor      # Validate configuration, vault, and startup
-./install.sh open-logs   # Open the log location
-./install.sh install     # Reinstall and start the startup service
-./install.sh uninstall   # Remove the service but retain settings
+```powershell
+.\install.ps1
 ```
 
-On Windows, use `install.cmd` with the same arguments.
+The script installer creates an isolated runtime in the user's application-data
+directory. It does not depend on the downloaded repository directory after
+installation.
+
+## Command-line management
+
+For POSIX systems, use `./install.sh <command>`. On Windows, use
+`install.cmd <command>`.
+
+| Command | Description |
+| --- | --- |
+| `setup` | Open credentials and connection settings |
+| `run` | Run the monitor interactively |
+| `run --once` | Perform one connection and login cycle |
+| `check` | Ask the running agent to check immediately |
+| `status` | Display live state and recent logs |
+| `doctor` | Validate configuration, credential vault, startup, and interfaces |
+| `open-logs` | Open the log location |
+| `install` | Install or repair login-time monitoring |
+| `uninstall` | Remove login-time monitoring while keeping settings and credentials |
+
+Example:
+
+```sh
+./install.sh doctor
+./install.sh status
+```
+
+## Data and security
+
+| Data | Storage |
+| --- | --- |
+| Password | Operating-system credential vault |
+| Username and connection settings | Per-user `WiFiAgent/config.json` |
+| Runtime status | Per-user `WiFiAgent/status.json` |
+| Logs | Per-user `WiFiAgent/agent.log`, with rotation |
+| Verified update installers | Per-user `WiFiAgent/updates/` |
+
+Platform configuration roots:
+
+- Windows: `%APPDATA%\WiFiAgent`
+- macOS: `~/Library/Application Support/WiFiAgent`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/WiFiAgent`
+
+Security properties:
+
+- Passwords are never written to project files, configuration JSON, status
+  snapshots, diagnostics, or logs.
+- Portal responses are sanitized before logging.
+- Public connectivity checks reject captive-portal redirects and retain normal
+  TLS verification.
+- TLS verification can be relaxed only for the configured portal when its
+  appliance uses a self-signed certificate.
+- Update metadata and downloads must use trusted GitHub HTTPS URLs.
+- Update files must match GitHub's published SHA-256 digest before execution.
+- Temporary and partial update downloads are not executed and are removed after
+  verification failures.
+
+WiFi Agent starts after user login rather than during pre-login boot because OS
+credential vaults are normally unavailable before the interactive session.
+
+## Troubleshooting
+
+| Symptom | Recommended action |
+| --- | --- |
+| macOS blocks the installer or app | Open **System Settings → Privacy & Security** and choose **Open Anyway**, then reopen WiFi Agent |
+| Windows shows an unknown publisher | Confirm the download came from this repository's Release page before continuing |
+| No Ethernet interface is detected | Connect the cable, choose **Refresh**, and select the adapter explicitly in Connection settings |
+| Portal shows reachable but not connected | Re-enter credentials, save them, and choose **Check Now** |
+| Portal is connected but internet is unavailable | The authenticated session is valid; inspect Diagnostics for upstream/probe failures |
+| Update verification fails | Retry the update; the rejected file is not executed and partial data is removed |
+| The agent is not running | Choose **Install / repair** or run the `doctor` command |
+
+Diagnostics and logs can be opened from the dashboard or tray/menu-bar menu.
+They do not include the saved password.
 
 ## Development
 
-Run the dependency-free regression suite with:
+### Run tests
+
+The regression suite does not require installed runtime dependencies:
 
 ```sh
 python -m unittest discover -s tests -v
 ```
 
-### Building native installers
+Run the same lint version used in CI:
 
-PyInstaller must run on the target operating system; it does not cross-compile
-Windows and macOS applications. Install the application and build dependencies
-on the target machine first:
+```sh
+python -m pip install ruff==0.15.17
+ruff check wifi_agent.py install.py packaging/generate_assets.py tests/test_wifi_agent.py
+```
+
+### Build native installers
+
+PyInstaller must run on the target operating system; native installers cannot
+be cross-compiled.
+
+Install build dependencies:
 
 ```sh
 python -m pip install -r requirements.txt -r packaging/requirements-build.txt
 ```
 
-On Windows, install Inno Setup 6 or 7 and run:
+Windows requires Inno Setup 6 or 7:
 
 ```powershell
 .\packaging\windows\build-installer.ps1
 ```
 
-On macOS, run:
+Build on macOS with:
 
 ```sh
 ./packaging/macos/build-installer.sh
 ```
 
-Outputs are written beneath `build/windows/installer` or
-`build/macos/installer`. The macOS builder produces both `.pkg` and `.dmg`
-files. Set `MACOS_APP_SIGNING_IDENTITY`, `MACOS_INSTALLER_SIGNING_IDENTITY`,
-and `APPLE_NOTARY_KEYCHAIN_PROFILE` to create Developer ID-signed and notarized
-release artifacts; without them, the builder creates development artifacts.
+Build outputs are written to:
 
-The Windows builder similarly signs both the application executable and setup
-executable when `WINDOWS_SIGNING_CERTIFICATE` points to a PFX file; provide its
-password through `WINDOWS_SIGNING_PASSWORD`.
+- `build/windows/installer`
+- `build/macos/installer`
 
-The **Build native installers** GitHub Actions workflow runs tests and builds a
-Windows x64 installer plus separate Apple silicon and Intel macOS installers.
-Every manual run publishes a prerelease page containing the `.exe`, `.pkg`, and
-`.dmg` files as direct downloads instead of requiring users to extract Actions
-artifact ZIPs. Pushing a version tag such as `v1.0.0` builds the installers and
-attaches them to the corresponding GitHub release automatically.
-When signing secrets are configured, workflow builds are signed and macOS
-installers are notarized. Without them, CI clearly marks the build as unsigned
-but still publishes testable installers. Configure these repository secrets for
-trusted public distribution:
+Every native builder runs the frozen application's runtime self-test before
+creating an installer.
 
-- `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD`
-- `MACOS_CERTIFICATE_BASE64` and `MACOS_CERTIFICATE_PASSWORD`
-- `MACOS_APP_SIGNING_IDENTITY` and `MACOS_INSTALLER_SIGNING_IDENTITY`
-- `APPLE_NOTARY_APPLE_ID`, `APPLE_NOTARY_PASSWORD`, and
-  `APPLE_NOTARY_TEAM_ID`
+### Signing and notarization
 
-## Security and startup
+Local Windows signing uses:
 
-The password is stored through the system credential API. Non-secret settings
-and the username are stored in the user's configuration directory. Portal-only
-TLS verification can be relaxed for appliances using self-signed certificates;
-internet probes continue to require trusted HTTPS certificates.
+- `WINDOWS_SIGNING_CERTIFICATE` — path to a PFX certificate
+- `WINDOWS_SIGNING_PASSWORD` — PFX password
 
-The monitor reloads changed settings without a restart, writes an atomic status
-snapshot for the UI and CLI, rejects captive-portal redirects during internet
-checks, and treats the portal's authenticated session response as authoritative
-when a public connectivity probe is unavailable. It sanitizes portal responses
-before logging and isolates unexpected cycle failures so one bad adapter or
-request does not stop the service.
+Local macOS signing and notarization use:
 
-WiFi Agent starts when the user logs in rather than during pre-login boot,
-because system credential vaults are normally locked before that point.
+- `MACOS_APP_SIGNING_IDENTITY`
+- `MACOS_INSTALLER_SIGNING_IDENTITY`
+- `APPLE_NOTARY_KEYCHAIN_PROFILE`
+
+The GitHub Actions workflow accepts the corresponding repository secrets listed
+in [the workflow](.github/workflows/build-installers.yml). When secrets are
+absent, CI publishes explicitly marked unsigned development installers.
+
+## Release automation
+
+The **Build native installers** workflow:
+
+- Runs tests and Ruff on Ubuntu.
+- Builds a Windows x64 installer on Windows.
+- Builds Apple silicon and Intel PKG/DMG installers on native macOS runners.
+- Runs packaged-runtime startup checks before publishing.
+- Publishes manual workflow runs as prereleases with direct installer assets.
+- Publishes version tags such as `v1.3.0` as stable GitHub Releases with the
+  matching file from `.github/release-notes/`.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
