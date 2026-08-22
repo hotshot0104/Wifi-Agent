@@ -56,6 +56,15 @@ else
 fi
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
+# Catch the most common "installs but will not open" failures before an
+# installer is published: invalid final signing, missing Tcl/Tk, tray backend,
+# vault, or image modules.
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/WiFi Agent"
+if ! "$APP_EXECUTABLE" self-test; then
+    echo "The packaged macOS application failed its startup self-test." >&2
+    exit 1
+fi
+
 PACKAGE_PATH="$OUTPUT_DIRECTORY/$ARTIFACT_STEM.pkg"
 PACKAGE_PAYLOAD="$BUILD_ROOT/package-payload"
 COMPONENT_PACKAGE="$BUILD_ROOT/WiFiAgent-component.pkg"

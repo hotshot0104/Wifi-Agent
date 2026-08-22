@@ -45,7 +45,7 @@ except ImportError:
 
 APP_NAME = "WiFiAgent"
 APP_DISPLAY_NAME = "WiFi Agent"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 if getattr(sys, "frozen", False):
     try:
         from wifi_agent_build import BUILD_VERSION
@@ -474,8 +474,12 @@ class PortalClient:
         except ET.ParseError:
             pass
         combined = " ".join(part for part in (status, message) if part) or "HTTP response received"
-        bad_words = ("fail", "invalid", "denied", "error", "could not", "maximum login")
-        success = status.upper() in {"ACK", "LIVE", "OK", "SUCCESS"}
+        bad_words = (
+            "fail", "invalid", "denied", "error", "could not", "maximum login",
+            "not logged", "logged out", "inactive", "expired", "dead",
+        )
+        rejected = any(word in combined.casefold() for word in bad_words)
+        success = status.upper() in {"ACK", "LIVE", "OK", "SUCCESS"} and not rejected
         if not status and message and not any(word in message.casefold() for word in bad_words):
             success = True
         return success, combined
@@ -534,6 +538,7 @@ class AgentSnapshot:
     ethernet_connected: bool = False
     interfaces: tuple[str, ...] = ()
     portal_port_open: bool | None = None
+    portal_authenticated: bool | None = None
     internet_available: bool | None = None
     paused: bool = False
     last_check_at: str | None = None
@@ -700,6 +705,7 @@ class AgentMonitor:
                 ethernet_connected=False,
                 interfaces=(),
                 portal_port_open=None,
+                portal_authenticated=None,
                 internet_available=None,
                 last_check_at=utc_now(),
             )
@@ -709,13 +715,19 @@ class AgentMonitor:
         ethernet = bool(interfaces)
         port_open = portal_port_open(client.host, client.port) if ethernet else None
         online = internet_available() if ethernet else None
-        state = (tuple(interfaces), port_open, online)
+        portal_authenticated: bool | None = None
+        keepalive_message = ""
+        if ethernet and port_open:
+            portal_authenticated, keepalive_message = client.keep_alive()
+
+        state = (tuple(interfaces), port_open, portal_authenticated, online)
         if state != self._last_logged_state:
             self.logger.info(
-                "Status: ethernet=%s (%s), portal-port=%s, internet=%s",
+                "Status: ethernet=%s (%s), portal-port=%s, portal-session=%s, internet=%s",
                 "connected" if ethernet else "disconnected",
                 ", ".join(interfaces) if interfaces else "none",
                 "open" if port_open is True else "closed/unreachable" if port_open is False else "not checked",
+                "authenticated" if portal_authenticated is True else "not authenticated" if portal_authenticated is False else "not checked",
                 "available" if online is True else "unavailable" if online is False else "not checked",
             )
             self._last_logged_state = state
@@ -724,37 +736,46 @@ class AgentMonitor:
         message = "Internet available" if online else "Internet unavailable"
         retry_in = max(0, int(self._next_login_at - time.monotonic()))
 
-        if ethernet and port_open and online:
+        if ethernet and port_open and portal_authenticated:
             self._reset_login_backoff()
-            ok, keepalive_message = client.keep_alive()
-            if ok:
-                self._keepalive_failures = 0
+            self._keepalive_failures = 0
+            if online:
+                phase = "online"
+                message = "Portal session connected; internet available"
             else:
-                self._keepalive_failures += 1
-                if self._keepalive_failures == 1 or self._keepalive_failures % 5 == 0:
-                    self.logger.warning("Portal keep-alive was not acknowledged: %s", keepalive_message)
+                phase = "connected"
+                message = "Portal session connected; internet check is inconclusive"
 
-        elif ethernet and port_open and not online:
+        elif ethernet and port_open and online:
+            self._reset_login_backoff()
+            self._keepalive_failures += 1
+            message = "Internet available"
+            if self._keepalive_failures == 1 or self._keepalive_failures % 5 == 0:
+                self.logger.warning("Portal session check was not acknowledged: %s", keepalive_message)
+
+        elif ethernet and port_open:
             now = time.monotonic()
             if now >= self._next_login_at:
                 self.logger.info("Ethernet and portal are reachable; attempting portal login")
                 ok, login_message = client.login()
                 if ok:
                     self.logger.info("Portal login accepted: %s", login_message)
+                    portal_authenticated = True
                     self._publish(last_login_at=utc_now())
                     if not self.stop_event.wait(3):
                         online = internet_available()
+                    self._reset_login_backoff()
+                    retry_in = 0
                     if online:
-                        self._reset_login_backoff()
                         phase = "online"
-                        message = "Login succeeded; internet available"
+                        message = "Portal session connected; internet available"
                         self.logger.info("Internet became available after portal login")
                     else:
-                        delay = self._schedule_login_retry(config)
-                        retry_in = delay
-                        message = f"Login accepted but internet is unavailable; retrying in {delay}s"
-                        self.logger.warning(message)
+                        phase = "connected"
+                        message = "Portal session connected; internet check is inconclusive"
+                        self.logger.info("Portal session is authenticated; public connectivity probes remain unavailable")
                 else:
+                    portal_authenticated = False
                     delay = self._schedule_login_retry(config)
                     retry_in = delay
                     message = f"Login failed; retrying in {delay}s"
@@ -775,13 +796,14 @@ class AgentMonitor:
             ethernet_connected=ethernet,
             interfaces=tuple(interfaces),
             portal_port_open=port_open,
+            portal_authenticated=portal_authenticated,
             internet_available=online,
             paused=False,
             last_check_at=utc_now(),
             consecutive_login_failures=self._login_failures,
             retry_in_seconds=retry_in,
         )
-        return bool(online)
+        return bool(online or portal_authenticated)
 
     def run(self, once: bool = False) -> int:
         self.logger.info("Agent monitor started")
@@ -1139,6 +1161,21 @@ def startup_is_installed() -> bool:
     return (Path.home() / ".config" / "systemd" / "user" / "wifi-agent.service").exists()
 
 
+def initial_setup_complete(config: dict[str, Any], startup_installed: bool | None = None) -> bool:
+    """Return whether credentials and login-time monitoring are ready."""
+    try:
+        normalized = validate_config(config, require_username=True)
+    except ValueError:
+        return False
+    if not (startup_is_installed() if startup_installed is None else startup_installed):
+        return False
+    try:
+        get_password(str(normalized["username"]))
+    except (OSError, RuntimeError, KeyringError):
+        return False
+    return True
+
+
 def uninstall_startup() -> str:
     if sys.platform == "win32":
         subprocess.run(
@@ -1189,6 +1226,9 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         config = validate_config(DEFAULT_CONFIG)
         configuration_warning = f"The saved configuration could not be loaded and must be repaired: {exc}"
+
+    startup_detected = startup_is_installed()
+    setup_required = {"value": not initial_setup_complete(config, startup_detected)}
 
     root = tk.Tk()
     is_macos = sys.platform == "darwin"
@@ -1265,9 +1305,16 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     header = ttk.Frame(main, style="App.TFrame")
     header.pack(fill="x", pady=(0, 14))
     ttk.Label(header, text="WiFi Agent Settings" if is_macos else "WiFi Agent", style="Header.TLabel").pack(anchor="w")
+    header_subtitle = tk.StringVar(
+        value=(
+            "Enter your portal credentials and finish initial setup to start monitoring"
+            if setup_required["value"]
+            else "Sophos/Cyberoam connectivity monitoring, secure login, and service management"
+        )
+    )
     ttk.Label(
         header,
-        text="Sophos/Cyberoam connectivity monitoring, secure login, and service management",
+        textvariable=header_subtitle,
         style="Subtitle.TLabel",
     ).pack(anchor="w", pady=(2, 0))
 
@@ -1276,9 +1323,12 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     overview_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
     settings_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
     diagnostics_tab = ttk.Frame(notebook, style="App.TFrame", padding=(2, 16, 2, 2))
-    notebook.add(overview_tab, text="General" if is_macos else "Overview")
-    notebook.add(settings_tab, text="Connection" if is_macos else "Settings")
-    notebook.add(diagnostics_tab, text="Diagnostics")
+    if setup_required["value"]:
+        notebook.add(settings_tab, text="Initial Setup")
+    else:
+        notebook.add(overview_tab, text="General" if is_macos else "Overview")
+        notebook.add(settings_tab, text="Connection" if is_macos else "Settings")
+        notebook.add(diagnostics_tab, text="Diagnostics")
 
     username = tk.StringVar(value=str(config["username"]))
     password = tk.StringVar()
@@ -1300,7 +1350,7 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     last_check_value = tk.StringVar(value="Never")
     feedback_value = tk.StringVar(value="Settings are stored locally; the password remains in the OS credential vault.")
     feedback_override_until = {"value": 0.0}
-    startup_installed = {"value": startup_is_installed()}
+    startup_installed = {"value": startup_detected}
     agent_running = {"value": False}
 
     def startup_description(installed: bool) -> str:
@@ -1331,7 +1381,7 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
         ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(7, 0))
 
     metric_card(0, "Ethernet", ethernet_value)
-    metric_card(1, "Portal port", portal_value)
+    metric_card(1, "Portal session", portal_value)
     metric_card(2, "Internet", internet_value)
 
     service_card = ttk.Frame(overview_tab, style="Surface.TFrame", padding=18)
@@ -1347,8 +1397,47 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     quick_actions = ttk.Frame(overview_tab, style="App.TFrame")
     quick_actions.pack(fill="x")
 
-    # Settings tab.
-    account_group = ttk.LabelFrame(settings_tab, text=" Account ", padding=14)
+    # Settings tab. The canvas keeps every action reachable in a partial-height
+    # Windows window while retaining the fixed Settings-window size on macOS.
+    settings_canvas = tk.Canvas(
+        settings_tab,
+        background=colors["background"],
+        borderwidth=0,
+        highlightthickness=0,
+    )
+    settings_scrollbar = ttk.Scrollbar(settings_tab, orient="vertical", command=settings_canvas.yview)
+    settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+    settings_scrollbar.pack(side="right", fill="y")
+    settings_canvas.pack(side="left", fill="both", expand=True)
+    settings_content = ttk.Frame(settings_canvas, style="App.TFrame")
+    settings_window = settings_canvas.create_window((0, 0), window=settings_content, anchor="nw")
+
+    def resize_settings_content(event=None) -> None:
+        settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+        settings_canvas.itemconfigure(settings_window, width=settings_canvas.winfo_width())
+
+    settings_content.bind("<Configure>", resize_settings_content)
+    settings_canvas.bind("<Configure>", resize_settings_content)
+
+    def scroll_settings(event) -> str | None:
+        if notebook.select() != str(settings_tab):
+            return None
+        if getattr(event, "num", None) == 4:
+            units = -3
+        elif getattr(event, "num", None) == 5:
+            units = 3
+        else:
+            delta = int(getattr(event, "delta", 0))
+            units = -max(-3, min(3, delta // 120 if abs(delta) >= 120 else delta))
+        if units:
+            settings_canvas.yview_scroll(units, "units")
+        return "break"
+
+    root.bind_all("<MouseWheel>", scroll_settings, add="+")
+    root.bind_all("<Button-4>", scroll_settings, add="+")
+    root.bind_all("<Button-5>", scroll_settings, add="+")
+
+    account_group = ttk.LabelFrame(settings_content, text=" Account ", padding=14)
     account_group.pack(fill="x", pady=(0, 10))
     account_group.columnconfigure(1, weight=1)
     ttk.Label(account_group, text="Username / roll number").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
@@ -1366,11 +1455,14 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
         variable=show_password,
         command=toggle_password_visibility,
     ).grid(row=1, column=2, padx=(8, 0), pady=5)
-    ttk.Label(account_group, text="Leave blank to keep the saved credential.", style="Hint.TLabel").grid(
+    password_hint = tk.StringVar(
+        value="Password is required for initial setup." if setup_required["value"] else "Leave blank to keep the saved credential."
+    )
+    ttk.Label(account_group, textvariable=password_hint, style="Hint.TLabel").grid(
         row=2, column=1, columnspan=2, sticky="w", pady=(0, 2)
     )
 
-    portal_group = ttk.LabelFrame(settings_tab, text=" Portal ", padding=14)
+    portal_group = ttk.LabelFrame(settings_content, text=" Portal ", padding=14)
     portal_group.pack(fill="x", pady=(0, 10))
     portal_group.columnconfigure(1, weight=1)
     ttk.Label(portal_group, text="Protocol").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
@@ -1387,7 +1479,7 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
         variable=insecure,
     ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(7, 2))
 
-    monitor_group = ttk.LabelFrame(settings_tab, text=" Monitoring & retry ", padding=14)
+    monitor_group = ttk.LabelFrame(settings_content, text=" Monitoring & retry ", padding=14)
     monitor_group.pack(fill="x", pady=(0, 10))
     monitor_group.columnconfigure(1, weight=1)
     ttk.Label(monitor_group, text="Network interface").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=5)
@@ -1422,11 +1514,11 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(7, 0))
     refresh_interfaces()
 
-    feedback = ttk.Frame(settings_tab, style="Surface.TFrame", padding=(12, 9))
+    feedback = ttk.Frame(settings_content, style="Surface.TFrame", padding=(12, 9))
     feedback.pack(fill="x", pady=(0, 10))
     ttk.Label(feedback, textvariable=feedback_value, style="StatusText.TLabel", wraplength=650).pack(anchor="w")
-    settings_actions = ttk.Frame(settings_tab, style="App.TFrame")
-    settings_actions.pack(fill="x")
+    settings_actions = ttk.Frame(settings_content, style="App.TFrame")
+    settings_actions.pack(fill="x", pady=(0, 2))
 
     # Diagnostics tab.
     diagnostic_header = ttk.Frame(diagnostics_tab, style="App.TFrame")
@@ -1524,6 +1616,15 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
             startup_installed["value"] = True
             startup_value.set(startup_description(True))
             set_feedback(message, seconds=8)
+            if setup_required["value"]:
+                setup_required["value"] = False
+                notebook.forget(settings_tab)
+                notebook.add(overview_tab, text="General" if is_macos else "Overview")
+                notebook.add(settings_tab, text="Connection" if is_macos else "Settings")
+                notebook.add(diagnostics_tab, text="Diagnostics")
+                password_hint.set("Leave blank to keep the saved credential.")
+                header_subtitle.set("Sophos/Cyberoam connectivity monitoring, secure login, and service management")
+                notebook.select(overview_tab)
             messagebox.showinfo("Service installed", message)
 
         run_background(install_startup, installed, "Installation failed")
@@ -1556,7 +1657,7 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
         def tested(result: tuple[list[str], bool | None, bool | None]) -> None:
             wired, open_, online = result
             ethernet_value.set("Connected" if wired else "Disconnected")
-            portal_value.set("Open" if open_ is True else "Unreachable" if open_ is False else "Not checked")
+            portal_value.set("Reachable" if open_ is True else "Unreachable" if open_ is False else "Not checked")
             internet_value.set("Available" if online is True else "Unavailable" if online is False else "Not checked")
             set_feedback(
                 f"Test complete — interface: {', '.join(wired) if wired else 'none'}; "
@@ -1688,7 +1789,10 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
 
     remembered_pane = str(load_ui_state().get("last_pane", ""))
     requested_pane = (initial_pane or remembered_pane).casefold()
-    if requested_pane in {"settings", "connection"}:
+    if setup_required["value"]:
+        notebook.select(settings_tab)
+        root.after(100, password_entry.focus_set)
+    elif requested_pane in {"settings", "connection"}:
         notebook.select(settings_tab)
     elif requested_pane == "diagnostics":
         notebook.select(diagnostics_tab)
@@ -1731,11 +1835,17 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
             if interfaces:
                 ethernet_value.set(f"Connected · {', '.join(str(value) for value in interfaces)}")
             port_state = snapshot.get("portal_port_open")
-            portal_value.set("Open" if port_state is True else "Unreachable" if port_state is False else "Not checked")
+            authenticated = snapshot.get("portal_authenticated")
+            portal_value.set(
+                "Connected" if authenticated is True else
+                "Reachable" if port_state is True else
+                "Unreachable" if port_state is False else
+                "Not checked"
+            )
             internet_state = snapshot.get("internet_available")
             internet_value.set("Available" if internet_state is True else "Unavailable" if internet_state is False else "Not checked")
             dot_color = (
-                colors["success"] if phase == "online" else
+                colors["success"] if phase in {"online", "connected"} else
                 colors["warning"] if phase in {"offline", "backoff", "paused"} else
                 colors["danger"] if phase in {"error", "needs-setup"} else
                 colors["idle"]
@@ -1775,7 +1885,9 @@ def print_status(*, json_output: bool = False, log_lines: int = 10) -> int:
         print(f"Checked:  {snapshot.get('last_check_at') or 'never'}")
         print(f"Ethernet: {'connected' if snapshot.get('ethernet_connected') else 'disconnected'}")
         port = snapshot.get("portal_port_open")
-        print(f"Portal:   {'open' if port is True else 'unreachable' if port is False else 'not checked'}")
+        authenticated = snapshot.get("portal_authenticated")
+        print(f"Portal:   {'connected' if authenticated is True else 'not connected' if authenticated is False else 'not checked'}")
+        print(f"Port:     {'reachable' if port is True else 'unreachable' if port is False else 'not checked'}")
         online = snapshot.get("internet_available")
         print(f"Internet: {'available' if online is True else 'unavailable' if online is False else 'not checked'}")
     else:
@@ -1826,6 +1938,21 @@ def run_doctor() -> int:
     return 0 if healthy else 1
 
 
+def run_packaging_self_test() -> int:
+    """Exercise GUI/runtime imports without opening a window."""
+    ensure_dependencies()
+    import tkinter
+    from PIL import Image
+    import pystray
+
+    interpreter = tkinter.Tcl()
+    if not interpreter.eval("info patch"):
+        raise RuntimeError("The bundled Tcl/Tk runtime did not initialize.")
+    if Image.new("RGBA", (1, 1)).size != (1, 1) or not getattr(pystray, "Icon", None):
+        raise RuntimeError("The bundled tray-image runtime did not initialize.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=f"{APP_DISPLAY_NAME} {APP_VERSION}")
@@ -1847,6 +1974,7 @@ def main() -> int:
     status_parser.add_argument("--logs", type=int, default=10, help="number of recent log lines")
     subparsers.add_parser("doctor", help="validate configuration, vault, startup, and interfaces")
     subparsers.add_parser("open-logs", help="open the agent log location")
+    subparsers.add_parser("self-test", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     try:
@@ -1873,6 +2001,8 @@ def main() -> int:
         if args.command == "open-logs":
             open_log_location()
             return 0
+        if args.command == "self-test":
+            return run_packaging_self_test()
     except (OSError, RuntimeError, ValueError, KeyringError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
         if sys.stderr is not None:

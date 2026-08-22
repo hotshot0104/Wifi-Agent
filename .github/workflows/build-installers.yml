@@ -29,6 +29,8 @@ jobs:
   windows:
     needs: test
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -57,10 +59,9 @@ jobs:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
-          if ("${{ github.ref_type }}" -eq "tag" -and (
-              [string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -or
-              [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD))) {
-            throw "Tagged releases require the Windows signing certificate and password secrets."
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -or
+              [string]::IsNullOrWhiteSpace($env:CERTIFICATE_PASSWORD)) {
+            throw "Published installers require the Windows signing certificate and password secrets."
           }
           if (-not [string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) {
             $CertificatePath = Join-Path $env:RUNNER_TEMP "wifi-agent-signing.pfx"
@@ -107,6 +108,8 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - run: python -m pip install -r requirements.txt -r packaging/requirements-build.txt
+      - name: Verify macOS GUI build support
+        run: python -c 'import tkinter; print("Tcl/Tk", tkinter.Tcl().eval("info patch"))'
       - name: Configure Apple signing and notarization
         shell: bash
         env:
@@ -118,14 +121,12 @@ jobs:
           NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
           NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
         run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            for required in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD APP_SIGNING_IDENTITY INSTALLER_SIGNING_IDENTITY NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
-              if [[ -z "${!required}" ]]; then
-                echo "Tagged releases require the $required signing secret." >&2
-                exit 1
-              fi
-            done
-          fi
+          for required in CERTIFICATE_BASE64 CERTIFICATE_PASSWORD APP_SIGNING_IDENTITY INSTALLER_SIGNING_IDENTITY NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
+            if [[ -z "${!required}" ]]; then
+              echo "Published installers require the $required signing secret." >&2
+              exit 1
+            fi
+          done
           if [[ -n "$CERTIFICATE_BASE64" ]]; then
             CERTIFICATE_PATH="$RUNNER_TEMP/wifi-agent-signing.p12"
             KEYCHAIN_PATH="$RUNNER_TEMP/wifi-agent-build.keychain-db"
@@ -158,7 +159,6 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
@@ -171,9 +171,25 @@ jobs:
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ needs.windows.outputs.version }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            RELEASE_TITLE="WiFi Agent ${GITHUB_REF_NAME#v}"
+            CREATE_ARGUMENTS=(--verify-tag --generate-notes)
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+            VERSION="$REQUESTED_VERSION"
+            RELEASE_TAG="installer-build-${GITHUB_RUN_NUMBER}"
+            RELEASE_TITLE="WiFi Agent $VERSION installers (build ${GITHUB_RUN_NUMBER})"
+            CREATE_ARGUMENTS=(--target "$GITHUB_SHA" --prerelease --notes "Direct installer downloads from workflow run ${GITHUB_RUN_NUMBER}.")
           fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TITLE" "${CREATE_ARGUMENTS[@]}"
+          fi
+
+          RELEASE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          echo "### Direct installer downloads" >> "$GITHUB_STEP_SUMMARY"
+          echo "Installers are attached individually at [$RELEASE_TITLE]($RELEASE_URL); no ZIP extraction is required." >> "$GITHUB_STEP_SUMMARY"

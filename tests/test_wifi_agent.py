@@ -78,6 +78,12 @@ class PortalTests(unittest.TestCase):
         )
         self.assertFalse(success)
 
+    def test_nominal_ack_with_logged_out_message_is_not_accepted(self) -> None:
+        success, _ = app.PortalClient._response_summary(
+            "<response><status>ACK</status><message>User is not logged in</message></response>"
+        )
+        self.assertFalse(success)
+
     def test_portal_message_redacts_password_and_controls(self) -> None:
         client = app.PortalClient(app.validate_config({"username": "student"}), "top-secret")
         self.assertEqual(client._safe_message("Error\nfor top-secret"), "Error for [redacted]")
@@ -97,7 +103,10 @@ class MonitorTests(unittest.TestCase):
         return monitor, config
 
     def test_offline_reachable_portal_logs_in_and_verifies_internet(self) -> None:
-        client = types.SimpleNamespace(login=Mock(return_value=(True, "LIVE")), keep_alive=Mock())
+        client = types.SimpleNamespace(
+            login=Mock(return_value=(True, "LIVE")),
+            keep_alive=Mock(return_value=(False, "DEAD")),
+        )
         monitor, _ = self.make_monitor(client)
         with (
             patch.object(app, "wired_interfaces", return_value=["Ethernet"]),
@@ -111,7 +120,10 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(monitor.snapshot.phase, "online")
 
     def test_login_failures_use_bounded_backoff(self) -> None:
-        client = types.SimpleNamespace(login=Mock(return_value=(False, "DENIED")), keep_alive=Mock())
+        client = types.SimpleNamespace(
+            login=Mock(return_value=(False, "DENIED")),
+            keep_alive=Mock(return_value=(False, "DEAD")),
+        )
         monitor, config = self.make_monitor(client)
         config["login_backoff_max_seconds"] = 60
         with (
@@ -128,6 +140,41 @@ class MonitorTests(unittest.TestCase):
             monitor.check_once()
         self.assertEqual(client.login.call_count, 3)
         self.assertEqual(monitor.snapshot.retry_in_seconds, 60)
+
+    def test_live_portal_session_is_connected_when_public_probe_fails(self) -> None:
+        client = types.SimpleNamespace(
+            login=Mock(),
+            keep_alive=Mock(return_value=(True, "LIVE Signed in")),
+        )
+        monitor, _ = self.make_monitor(client)
+        with (
+            patch.object(app, "wired_interfaces", return_value=["Ethernet"]),
+            patch.object(app, "portal_port_open", return_value=True),
+            patch.object(app, "internet_available", return_value=False),
+            patch.object(app, "write_status"),
+        ):
+            self.assertTrue(monitor.check_once())
+        client.login.assert_not_called()
+        self.assertEqual(monitor.snapshot.phase, "connected")
+        self.assertTrue(monitor.snapshot.portal_authenticated)
+
+    def test_accepted_login_stays_connected_when_public_probe_fails(self) -> None:
+        client = types.SimpleNamespace(
+            login=Mock(return_value=(True, "ACK Signed in")),
+            keep_alive=Mock(return_value=(False, "DEAD")),
+        )
+        monitor, _ = self.make_monitor(client)
+        with (
+            patch.object(app, "wired_interfaces", return_value=["Ethernet"]),
+            patch.object(app, "portal_port_open", return_value=True),
+            patch.object(app, "internet_available", return_value=False),
+            patch.object(app, "write_status"),
+            patch.object(monitor.stop_event, "wait", return_value=False),
+        ):
+            self.assertTrue(monitor.check_once())
+        self.assertEqual(monitor.snapshot.phase, "connected")
+        self.assertTrue(monitor.snapshot.portal_authenticated)
+        self.assertEqual(monitor.snapshot.consecutive_login_failures, 0)
 
     def test_unreachable_port_resets_retry_storm(self) -> None:
         client = types.SimpleNamespace(login=Mock(), keep_alive=Mock())
@@ -153,6 +200,17 @@ class MonitorTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
+    def test_initial_setup_requires_credentials_and_startup(self) -> None:
+        config = app.validate_config({"username": "student"})
+        self.assertFalse(app.initial_setup_complete(config, startup_installed=False))
+        with patch.object(app, "get_password", return_value="secret"):
+            self.assertTrue(app.initial_setup_complete(config, startup_installed=True))
+
+    def test_initial_setup_detects_missing_vault_password(self) -> None:
+        config = app.validate_config({"username": "student"})
+        with patch.object(app, "get_password", side_effect=RuntimeError("missing")):
+            self.assertFalse(app.initial_setup_complete(config, startup_installed=True))
+
     def test_frozen_application_commands_do_not_reference_source_script(self) -> None:
         executable = Path("/Applications/WiFi Agent.app/Contents/MacOS/WiFi Agent")
         with (

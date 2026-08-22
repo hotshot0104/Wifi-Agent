@@ -44,11 +44,12 @@ The macOS package installs **WiFi Agent.app** in `/Applications` and opens its
 settings for the signed-in user. The disk image offers the familiar alternative
 of dragging **WiFi Agent.app** into **Applications** and opening it once.
 
-Enter the portal credentials and settings, select the correct Ethernet adapter
-if automatic detection is unsuitable, choose **Test Connection**, then choose
-**Save & Install at Login** on macOS or **Save & install** on Windows. This
-stores the password in the operating-system credential vault and activates the
-login-time agent.
+On first opening, WiFi Agent shows only the initial credential and connection
+setup. Enter the portal credentials and settings, select the correct Ethernet
+adapter if automatic detection is unsuitable, choose **Test Connection**, then
+choose **Save & Install at Login** on macOS or **Save & install** on Windows.
+This stores the password in the operating-system credential vault, activates
+the login-time agent, and then reveals the live dashboard.
 
 ### Script installation
 
@@ -150,10 +151,12 @@ password through `WINDOWS_SIGNING_PASSWORD`.
 
 The **Build native installers** GitHub Actions workflow runs tests and builds a
 Windows x64 installer plus separate Apple silicon and Intel macOS installers.
-Run it manually for test artifacts. Pushing a version tag such as `v1.0.0`
-builds the installers and attaches them to a GitHub release automatically.
-Tagged builds intentionally fail instead of publishing unsigned software. Add
-the following repository secrets before creating a release tag:
+Every manual run publishes a prerelease page containing the `.exe`, `.pkg`, and
+`.dmg` files as direct downloads instead of requiring users to extract Actions
+artifact ZIPs. Pushing a version tag such as `v1.0.0` builds the installers and
+attaches them to the corresponding GitHub release automatically.
+Published workflow builds intentionally fail instead of distributing unsigned
+software. Add the following repository secrets before running the workflow:
 
 - `WINDOWS_CERTIFICATE_BASE64` and `WINDOWS_CERTIFICATE_PASSWORD`
 - `MACOS_CERTIFICATE_BASE64` and `MACOS_CERTIFICATE_PASSWORD`
@@ -170,8 +173,10 @@ internet probes continue to require trusted HTTPS certificates.
 
 The monitor reloads changed settings without a restart, writes an atomic status
 snapshot for the UI and CLI, rejects captive-portal redirects during internet
-checks, sanitizes portal responses before logging, and isolates unexpected
-cycle failures so one bad adapter or request does not stop the service.
+checks, and treats the portal's authenticated session response as authoritative
+when a public connectivity probe is unavailable. It sanitizes portal responses
+before logging and isolates unexpected cycle failures so one bad adapter or
+request does not stop the service.
 
 WiFi Agent starts when the user logs in rather than during pre-login boot,
 because system credential vaults are normally locked before that point.

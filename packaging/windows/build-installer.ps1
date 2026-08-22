@@ -71,7 +71,10 @@ try {
     )
     & python -m PyInstaller @PyInstallerArguments
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed." }
-    Invoke-CodeSigning (Join-Path $BuildRoot "dist\WiFiAgent\WiFiAgent.exe")
+    $ApplicationExecutable = Join-Path $BuildRoot "dist\WiFiAgent\WiFiAgent.exe"
+    & $ApplicationExecutable self-test
+    if ($LASTEXITCODE -ne 0) { throw "The packaged Windows application failed its startup self-test." }
+    Invoke-CodeSigning $ApplicationExecutable
 
     $CompilerCandidates = @(
         (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
