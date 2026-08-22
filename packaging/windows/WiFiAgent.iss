@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "1.2.0"
+  #define AppVersion "1.3.0"
 #endif
 #ifndef BuildRoot
   #define BuildRoot "..\..\build\windows"
@@ -57,6 +57,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Parameters: "setup"; Description: "Open {#AppName} settings"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Parameters: "tray"; WorkingDir: "{app}"; Flags: nowait skipifnotsilent
 
 [UninstallRun]
 Filename: "{app}\{#AppExeName}"; Parameters: "uninstall"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated skipifdoesntexist

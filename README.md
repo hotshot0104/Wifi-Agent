@@ -1,14 +1,14 @@
 # WiFi Agent
 
-## Download version 1.2.0
+## Download version 1.3.0
 
 Installers are available directly—no ZIP extraction or separate Python runtime
 is required:
 
-- [Windows 64-bit setup](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-Windows-x64-Setup.exe)
-- [Apple silicon Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-macOS-arm64.pkg)
-- [Intel Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.2.0/WiFiAgent-1.2.0-macOS-x86_64.pkg)
-- [All installers and release notes](https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.2.0)
+- [Windows 64-bit setup](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-Windows-x64-Setup.exe)
+- [Apple silicon Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-arm64.pkg)
+- [Intel Mac package](https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/WiFiAgent-1.3.0-macOS-x86_64.pkg)
+- [All installers and release notes](https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.3.0)
 
 WiFi Agent is a lightweight, cross-platform background service for networks
 using a Sophos or Cyberoam captive portal. It monitors wired connectivity,
@@ -29,6 +29,13 @@ automatically restores or keeps alive an authenticated session.
 - Starts automatically at user login and restarts after failures.
 - Prevents duplicate monitor instances and uses bounded exponential retry
   backoff when a portal or upstream connection is unhealthy.
+- Checks for updates from inside the app, verifies the selected native installer
+  with its GitHub SHA-256 digest, and installs it without clearing saved setup.
+
+Version 1.3.0 and later can install future updates from **Check for updates** in
+the dashboard or notification-area/menu-bar menu. Users upgrading from 1.2.0
+install 1.3.0 once using the links above; later releases can be installed inside
+WiFi Agent.
 
 ## Requirements
 

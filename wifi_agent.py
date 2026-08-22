@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 import getpass
+import hashlib
 from html import escape as xml_escape
 import ipaddress
 import json
@@ -16,6 +17,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import platform
 import plistlib
 import random
 import re
@@ -28,7 +30,7 @@ import threading
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, quote
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 try:
@@ -45,7 +47,7 @@ except ImportError:
 
 APP_NAME = "WiFiAgent"
 APP_DISPLAY_NAME = "WiFi Agent"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 if getattr(sys, "frozen", False):
     try:
         from wifi_agent_build import BUILD_VERSION
@@ -54,6 +56,9 @@ if getattr(sys, "frozen", False):
     except ImportError:
         pass
 KEYRING_SERVICE = "WiFi Agent"
+RELEASES_API_URL = "https://api.github.com/repos/akshajtiwari/Wifi-Agent/releases/latest"
+GITHUB_API_VERSION = "2026-03-10"
+MAX_UPDATE_SIZE = 250 * 1024 * 1024
 DEFAULT_CONFIG: dict[str, Any] = {
     "username": "",
     "portal_scheme": "https",
@@ -88,6 +93,167 @@ WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        raise ValueError(f"Unsupported release version: {value!r}")
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    version: str
+    asset_name: str
+    download_url: str
+    release_url: str
+    size: int
+    sha256: str
+
+
+def _update_asset_name(version: str, system: str | None = None, machine: str | None = None) -> str:
+    system = system or sys.platform
+    machine = (machine or platform.machine()).casefold()
+    if system == "win32":
+        if machine not in {"amd64", "x86_64"}:
+            raise RuntimeError(f"Automatic updates are not available for Windows architecture {machine}.")
+        return f"WiFiAgent-{version}-Windows-x64-Setup.exe"
+    if system == "darwin":
+        if machine in {"arm64", "aarch64"}:
+            architecture = "arm64"
+        elif machine in {"amd64", "x86_64"}:
+            architecture = "x86_64"
+        else:
+            raise RuntimeError(f"Automatic updates are not available for Mac architecture {machine}.")
+        return f"WiFiAgent-{version}-macOS-{architecture}.pkg"
+    raise RuntimeError("Automatic updates are currently available only for native Windows and macOS installations.")
+
+
+def check_for_update(*, opener=None, system: str | None = None, machine: str | None = None) -> UpdateInfo | None:
+    """Return the latest compatible stable update, if it is newer."""
+    request = Request(
+        RELEASES_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        },
+    )
+    release_opener = opener or build_opener(HTTPSHandler(context=ssl.create_default_context()))
+    try:
+        with release_opener.open(request, timeout=15) as response:
+            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not check for updates: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned an invalid release response.")
+
+    tag = str(payload.get("tag_name", ""))
+    latest = _version_tuple(tag)
+    if latest <= _version_tuple(APP_VERSION):
+        return None
+    version = ".".join(str(part) for part in latest)
+    expected_name = _update_asset_name(version, system, machine)
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError(f"Release {version} does not contain installer assets.")
+    asset = next(
+        (candidate for candidate in assets if isinstance(candidate, dict) and candidate.get("name") == expected_name),
+        None,
+    )
+    if asset is None or asset.get("state") not in {None, "uploaded"}:
+        raise RuntimeError(f"Release {version} does not include {expected_name}.")
+
+    download_url = str(asset.get("browser_download_url", ""))
+    parsed_download = urlparse(download_url)
+    if parsed_download.scheme != "https" or parsed_download.hostname != "github.com":
+        raise RuntimeError("The update download URL is not a trusted GitHub HTTPS URL.")
+    release_url = str(payload.get("html_url", ""))
+    parsed_release = urlparse(release_url)
+    if parsed_release.scheme != "https" or parsed_release.hostname != "github.com":
+        raise RuntimeError("The update release URL is not a trusted GitHub HTTPS URL.")
+    try:
+        size = int(asset.get("size", 0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("The update has an invalid download size.") from exc
+    if not 0 < size <= MAX_UPDATE_SIZE:
+        raise RuntimeError("The update download size is invalid or exceeds the safety limit.")
+    digest = str(asset.get("digest", ""))
+    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        raise RuntimeError("The update does not provide a valid SHA-256 digest.")
+    return UpdateInfo(version, expected_name, download_url, release_url, size, digest.partition(":")[2].casefold())
+
+
+def download_update(update: UpdateInfo, *, opener=None) -> Path:
+    """Download and verify an update installer into the private app directory."""
+    update_directory = app_dir() / "updates"
+    update_directory.mkdir(parents=True, exist_ok=True)
+    destination = update_directory / update.asset_name
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    request = Request(update.download_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    download_opener = opener or build_opener(HTTPSHandler(context=ssl.create_default_context()))
+    digest = hashlib.sha256()
+    downloaded = 0
+    try:
+        with download_opener.open(request, timeout=30) as response, temporary.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > update.size or downloaded > MAX_UPDATE_SIZE:
+                    raise RuntimeError("The update download exceeded its declared size.")
+                digest.update(chunk)
+                output.write(chunk)
+        if downloaded != update.size:
+            raise RuntimeError(f"The update download was incomplete ({downloaded} of {update.size} bytes).")
+        if digest.hexdigest().casefold() != update.sha256.casefold():
+            raise RuntimeError("The update failed SHA-256 verification and was not opened.")
+        temporary.replace(destination)
+    except (HTTPError, URLError, OSError, TimeoutError) as exc:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"Could not download the update: {exc}") from exc
+    except RuntimeError:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def install_downloaded_update(installer: Path) -> None:
+    """Start the platform-native installer for a verified update."""
+    installer = installer.resolve(strict=True)
+    if installer.parent != (app_dir() / "updates").resolve():
+        raise RuntimeError("Refusing to open an update outside the private update directory.")
+    if sys.platform == "win32":
+        subprocess.Popen(
+            [
+                str(installer),
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+                "/CLOSEAPPLICATIONS",
+                "/FORCECLOSEAPPLICATIONS",
+            ],
+            cwd=str(installer.parent),
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+        return
+    if sys.platform == "darwin":
+        apple_script = (
+            'on run argv\n'
+            'do shell script "/usr/sbin/installer -pkg " & quoted form of item 1 of argv & '
+            '" -target /" with administrator privileges\n'
+            'end run'
+        )
+        subprocess.run(
+            ["osascript", "-e", apple_script, str(installer)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return
+    raise RuntimeError("Automatic installation is currently available only on Windows and macOS.")
 
 
 def _portal_authority(host: str, port: int) -> str:
@@ -886,10 +1052,12 @@ def _application_working_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def spawn_setup_window(pane: str | None = None) -> None:
+def spawn_setup_window(pane: str | None = None, *, check_updates: bool = False) -> None:
     command = _application_command("setup")
     if pane:
         command.extend(["--pane", pane])
+    if check_updates:
+        command.append("--check-updates")
     subprocess.Popen(
         command,
         cwd=str(_application_working_directory()),
@@ -970,6 +1138,13 @@ def run_tray() -> int:
             if getattr(icon, "HAS_NOTIFICATION", True):
                 icon.notify(str(exc), "Could not open diagnostics")
 
+    def open_updates(icon, item) -> None:
+        try:
+            spawn_setup_window("overview", check_updates=True)
+        except OSError as exc:
+            if getattr(icon, "HAS_NOTIFICATION", True):
+                icon.notify(str(exc), "Could not check for updates")
+
     def check_now(icon, item) -> None:
         monitor.request_check()
         try:
@@ -1019,6 +1194,7 @@ def run_tray() -> int:
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Check Now" if is_macos else "Check and log in now", check_now),
         pause_item,
+        pystray.MenuItem("Check for Updates…" if is_macos else "Check for updates", open_updates),
         pystray.MenuItem("View Diagnostics…", open_diagnostics),
         pystray.MenuItem("Open Logs…" if is_macos else "Open logs", open_logs),
         pystray.Menu.SEPARATOR,
@@ -1203,7 +1379,7 @@ def uninstall_startup() -> str:
     return "Linux systemd user service removed. Saved settings were kept."
 
 
-def show_setup_ui(initial_pane: str | None = None) -> int:
+def show_setup_ui(initial_pane: str | None = None, *, check_updates_on_open: bool = False) -> int:
     ensure_dependencies()
     try:
         import tkinter as tk
@@ -1593,7 +1769,7 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
             button.configure(state=state)
         root.configure(cursor="watch" if busy else "")
 
-    def run_background(work, on_success, title: str) -> None:
+    def run_background(work, on_success, title: str, *, show_errors: bool = True) -> None:
         set_busy(True)
 
         def worker() -> None:
@@ -1602,7 +1778,8 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
                 root.after(0, lambda: on_success(result))
             except Exception as exc:
                 detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) and exc.stderr else str(exc)
-                root.after(0, lambda message=detail: messagebox.showerror(title, message))
+                if show_errors:
+                    root.after(0, lambda message=detail: messagebox.showerror(title, message))
             finally:
                 root.after(0, lambda: set_busy(False))
 
@@ -1673,6 +1850,66 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
             return
         request_external_check()
         set_feedback("Immediate check requested. Live status will update when the agent finishes.")
+
+    def check_updates(interactive: bool = True) -> None:
+        if sys.platform not in {"win32", "darwin"}:
+            if interactive:
+                messagebox.showinfo(
+                    "Updates",
+                    "Automatic updates are available in the native Windows and macOS installations.",
+                )
+            return
+
+        def checked(update: UpdateInfo | None) -> None:
+            if update is None:
+                if interactive:
+                    messagebox.showinfo("No updates", f"WiFi Agent {APP_VERSION} is the latest version.")
+                return
+            should_install = messagebox.askyesno(
+                "Update available",
+                f"WiFi Agent {update.version} is available.\n\n"
+                "Download, verify, and install it now? Your credentials and settings will be kept.",
+            )
+            if not should_install:
+                return
+
+            def downloaded(installer: Path) -> None:
+                def start_installation() -> None:
+                    if sys.platform == "win32":
+                        messagebox.showinfo(
+                            "Installing update",
+                            "WiFi Agent will close while the verified update installs, then restart in the notification area.",
+                        )
+                        install_downloaded_update(installer)
+                        root.after(150, root.destroy)
+                        return
+
+                    def installed(_result: None) -> None:
+                        root.destroy()
+
+                    run_background(
+                        lambda: install_downloaded_update(installer),
+                        installed,
+                        "Update installation failed",
+                    )
+
+                root.after(50, start_installation)
+
+            root.after(
+                50,
+                lambda: run_background(
+                    lambda: download_update(update),
+                    downloaded,
+                    "Update download failed",
+                ),
+            )
+
+        run_background(
+            check_for_update,
+            checked,
+            "Update check failed",
+            show_errors=interactive,
+        )
 
     def safe_open_logs() -> None:
         try:
@@ -1752,6 +1989,13 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
     remove_button.pack(side="left", padx=4)
     check_button = ttk.Button(quick_actions, text="Check Now" if is_macos else "Check now", command=check_now, style="Accent.TButton")
     check_button.pack(side="left", padx=(0, 8))
+    update_button = ttk.Button(
+        quick_actions,
+        text="Check for Updates…" if is_macos else "Check for updates",
+        command=check_updates,
+        style="Action.TButton",
+    )
+    update_button.pack(side="left", padx=4)
     ttk.Button(
         quick_actions,
         text="Connection Settings…" if is_macos else "Open settings",
@@ -1785,7 +2029,9 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
         command=safe_open_logs,
         style="Action.TButton",
     ).pack(side="right")
-    busy_buttons.extend([install_button, remove_button, check_button, test_button, save_button, save_install_button])
+    busy_buttons.extend(
+        [install_button, remove_button, check_button, update_button, test_button, save_button, save_install_button]
+    )
 
     remembered_pane = str(load_ui_state().get("last_pane", ""))
     requested_pane = (initial_pane or remembered_pane).casefold()
@@ -1863,6 +2109,14 @@ def show_setup_ui(initial_pane: str | None = None) -> int:
 
     refresh_status()
     refresh_diagnostics()
+    if check_updates_on_open and not setup_required["value"]:
+        root.after(500, check_updates)
+    elif (
+        getattr(sys, "frozen", False)
+        and sys.platform in {"win32", "darwin"}
+        and not setup_required["value"]
+    ):
+        root.after(2500, lambda: check_updates(False))
     if configuration_warning:
         root.after(100, lambda: messagebox.showwarning("Configuration needs repair", configuration_warning))
 
@@ -1963,6 +2217,7 @@ def main() -> int:
         choices=("overview", "general", "settings", "connection", "diagnostics"),
         help="open a specific settings pane",
     )
+    setup_parser.add_argument("--check-updates", action="store_true", help=argparse.SUPPRESS)
     run_parser = subparsers.add_parser("run", help="run the background monitor")
     run_parser.add_argument("--once", action="store_true", help="perform one status/login cycle")
     subparsers.add_parser("tray", help="run the macOS menu-bar or Windows notification-area manager")
@@ -1979,7 +2234,10 @@ def main() -> int:
 
     try:
         if args.command in (None, "setup"):
-            return show_setup_ui(getattr(args, "pane", None))
+            return show_setup_ui(
+                getattr(args, "pane", None),
+                check_updates_on_open=getattr(args, "check_updates", False),
+            )
         if args.command == "run":
             return run_agent(args.once)
         if args.command == "tray":

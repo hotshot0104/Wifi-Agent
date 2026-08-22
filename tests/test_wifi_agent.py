@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import logging
 from pathlib import Path
 import plistlib
@@ -17,6 +20,30 @@ def test_logger() -> logging.Logger:
     logger = logging.getLogger("wifi-agent-tests")
     logger.handlers[:] = [logging.NullHandler()]
     return logger
+
+
+class FakeResponse:
+    def __init__(self, content: bytes):
+        self.stream = io.BytesIO(content)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.stream.read(size)
+
+
+class FakeOpener:
+    def __init__(self, content: bytes):
+        self.content = content
+        self.requests = []
+
+    def open(self, request, timeout: float):
+        self.requests.append((request, timeout))
+        return FakeResponse(self.content)
 
 
 class ConfigTests(unittest.TestCase):
@@ -62,6 +89,155 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(app.load_ui_state()["last_pane"], "diagnostics")
                 if sys.platform != "win32":
                     self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+
+
+class UpdateTests(unittest.TestCase):
+    def release_payload(self, version: str, *, digest: str | None = None) -> dict:
+        asset_name = f"WiFiAgent-{version}-Windows-x64-Setup.exe"
+        return {
+            "tag_name": f"v{version}",
+            "html_url": f"https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v{version}",
+            "assets": [
+                {
+                    "name": asset_name,
+                    "state": "uploaded",
+                    "size": 123,
+                    "digest": digest or "sha256:" + "a" * 64,
+                    "browser_download_url": (
+                        f"https://github.com/akshajtiwari/Wifi-Agent/releases/download/v{version}/{asset_name}"
+                    ),
+                }
+            ],
+        }
+
+    def test_selects_platform_specific_installer_names(self) -> None:
+        self.assertEqual(
+            app._update_asset_name("1.4.0", "win32", "AMD64"),
+            "WiFiAgent-1.4.0-Windows-x64-Setup.exe",
+        )
+        self.assertEqual(
+            app._update_asset_name("1.4.0", "darwin", "arm64"),
+            "WiFiAgent-1.4.0-macOS-arm64.pkg",
+        )
+        self.assertEqual(
+            app._update_asset_name("1.4.0", "darwin", "x86_64"),
+            "WiFiAgent-1.4.0-macOS-x86_64.pkg",
+        )
+
+    def test_latest_release_returns_verified_compatible_update(self) -> None:
+        payload = self.release_payload("1.4.0")
+        opener = FakeOpener(json.dumps(payload).encode())
+        update = app.check_for_update(opener=opener, system="win32", machine="AMD64")
+        self.assertIsNotNone(update)
+        assert update is not None
+        self.assertEqual(update.version, "1.4.0")
+        self.assertEqual(update.sha256, "a" * 64)
+        self.assertEqual(opener.requests[0][0].get_header("X-github-api-version"), app.GITHUB_API_VERSION)
+
+    def test_current_release_does_not_offer_an_update(self) -> None:
+        payload = self.release_payload(app.APP_VERSION)
+        self.assertIsNone(
+            app.check_for_update(
+                opener=FakeOpener(json.dumps(payload).encode()),
+                system="win32",
+                machine="AMD64",
+            )
+        )
+
+    def test_release_without_digest_is_rejected(self) -> None:
+        payload = self.release_payload("1.4.0")
+        payload["assets"][0]["digest"] = None
+        with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+            app.check_for_update(
+                opener=FakeOpener(json.dumps(payload).encode()),
+                system="win32",
+                machine="AMD64",
+            )
+
+    def test_untrusted_release_download_url_is_rejected(self) -> None:
+        payload = self.release_payload("1.4.0")
+        payload["assets"][0]["browser_download_url"] = "https://example.com/update.exe"
+        with self.assertRaisesRegex(RuntimeError, "trusted GitHub"):
+            app.check_for_update(
+                opener=FakeOpener(json.dumps(payload).encode()),
+                system="win32",
+                machine="AMD64",
+            )
+
+    def test_oversized_update_is_rejected(self) -> None:
+        payload = self.release_payload("1.4.0")
+        payload["assets"][0]["size"] = app.MAX_UPDATE_SIZE + 1
+        with self.assertRaisesRegex(RuntimeError, "safety limit"):
+            app.check_for_update(
+                opener=FakeOpener(json.dumps(payload).encode()),
+                system="win32",
+                machine="AMD64",
+            )
+
+    def test_download_is_saved_only_after_digest_verification(self) -> None:
+        content = b"verified native installer"
+        digest = hashlib.sha256(content).hexdigest()
+        update = app.UpdateInfo(
+            "1.3.0",
+            "WiFiAgent-1.3.0-Windows-x64-Setup.exe",
+            "https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/test.exe",
+            "https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.3.0",
+            len(content),
+            digest,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "app_dir", return_value=Path(directory)):
+            installer = app.download_update(update, opener=FakeOpener(content))
+            self.assertEqual(installer.read_bytes(), content)
+            self.assertFalse(installer.with_suffix(".exe.part").exists())
+
+    def test_digest_mismatch_deletes_partial_download(self) -> None:
+        content = b"tampered installer"
+        update = app.UpdateInfo(
+            "1.3.0",
+            "WiFiAgent-1.3.0-Windows-x64-Setup.exe",
+            "https://github.com/akshajtiwari/Wifi-Agent/releases/download/v1.3.0/test.exe",
+            "https://github.com/akshajtiwari/Wifi-Agent/releases/tag/v1.3.0",
+            len(content),
+            "0" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "app_dir", return_value=Path(directory)):
+            with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+                app.download_update(update, opener=FakeOpener(content))
+            self.assertEqual(list((Path(directory) / "updates").glob("*")), [])
+
+    def test_windows_update_uses_silent_forced_close_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "updates" / "update.exe"
+            installer.parent.mkdir()
+            installer.write_bytes(b"installer")
+            with (
+                patch.object(app, "app_dir", return_value=root),
+                patch.object(app.sys, "platform", "win32"),
+                patch.object(app.subprocess, "Popen") as popen,
+            ):
+                app.install_downloaded_update(installer)
+        arguments = popen.call_args.args[0]
+        self.assertEqual(arguments[0], str(installer))
+        self.assertIn("/VERYSILENT", arguments)
+        self.assertIn("/FORCECLOSEAPPLICATIONS", arguments)
+
+    def test_macos_update_uses_native_administrator_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "updates" / "update.pkg"
+            installer.parent.mkdir()
+            installer.write_bytes(b"installer")
+            with (
+                patch.object(app, "app_dir", return_value=root),
+                patch.object(app.sys, "platform", "darwin"),
+                patch.object(app.subprocess, "run") as run,
+            ):
+                app.install_downloaded_update(installer)
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[0], "osascript")
+        self.assertIn("administrator privileges", arguments[2])
+        self.assertEqual(arguments[-1], str(installer))
 
 
 class PortalTests(unittest.TestCase):

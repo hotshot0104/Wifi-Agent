@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0 — 2026-08-22
+
+### Highlights
+
+- Added an in-app updater for native Windows and macOS installations.
+- Added quiet update checks on dashboard launch plus explicit update actions in
+  the dashboard and notification-area/menu-bar menu.
+- Selects the correct Windows x64, Apple silicon, or Intel Mac installer from
+  the latest stable GitHub Release.
+- Restricts release metadata and downloads to trusted GitHub HTTPS URLs, caps
+  download size, and requires SHA-256 digest verification before installation.
+- Preserves portal credentials, connection settings, and login-time startup
+  state during updates.
+- Restarts the Windows tray process after a silent update and uses the native
+  macOS administrator authorization prompt for package installation.
+
 ## 1.2.0 — 2026-08-22
 
 ### Highlights
