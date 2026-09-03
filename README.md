@@ -5,15 +5,15 @@
 WiFi Agent monitors Ethernet connectivity, restores authenticated portal
 sessions, and keeps connection status visible from a native desktop interface.
 
-[![Live demo](https://img.shields.io/badge/Live%20demo-wifi--agent.vercel.app-black?logo=vercel)](https://wifi-agent.vercel.app/)
+[![Website](https://img.shields.io/badge/Website-wifi--agent.vercel.app-black?logo=vercel)](https://wifi-agent.vercel.app/)
 [![Latest release](https://img.shields.io/github/v/release/akshajtiwari/Wifi-Agent?display_name=tag&sort=semver)](https://github.com/akshajtiwari/Wifi-Agent/releases/latest)
 [![Native installer builds](https://github.com/akshajtiwari/Wifi-Agent/actions/workflows/build-installers.yml/badge.svg)](https://github.com/akshajtiwari/Wifi-Agent/actions/workflows/build-installers.yml)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](#source-installation)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-555)](#downloads)
 
-[Download](#downloads) · [Live demo](https://wifi-agent.vercel.app/) · [Quick start](#quick-start) · [Usage](#using-wifi-agent) · [Troubleshooting](#troubleshooting) · [Development](#development)
+[Download](#downloads) · [Website](https://wifi-agent.vercel.app/) · [Quick start](#quick-start) · [Usage](#using-wifi-agent) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
-> **Live site:** https://wifi-agent.vercel.app/ — deployed from [`frontend/index.html`](frontend/index.html).
+> **Official website:** https://wifi-agent.vercel.app/ — static download site for WiFi Agent, deployed from [`frontend/index.html`](frontend/index.html).
 
 ## Overview
 
@@ -36,7 +36,7 @@ then logs in only when action is required.
 
 ## Downloads
 
-**Try it live:** [https://wifi-agent.vercel.app/](https://wifi-agent.vercel.app/)
+**Official website / download site:** [https://wifi-agent.vercel.app/](https://wifi-agent.vercel.app/)
 
 ### WiFi Agent 1.3.0
 
